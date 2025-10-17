@@ -20,7 +20,6 @@ class Detection:
         )
         self.logger = logging.getLogger(__name__)
 
-        #Load from config file
         try:
             with open(config, 'r', encoding="utf-8") as file:
                 data = yaml.safe_load(file)
@@ -52,7 +51,6 @@ class Detection:
         self.weight = 0
         self.save_path = data['save_path']
 
-        #Load model YoloV8
         try:
             self.model = YOLO(data['model_path'])
             self.logger.info(f"Model loaded successfully from {data['model_path']}")
@@ -68,17 +66,15 @@ class Detection:
             if frame is None or frame.size == 0:
                 raise ValueError("Invalid frame provided for processing")
                 
-            results = self.model(frame)[0]
+            results = self.model(frame, conf=self.confidence, classes=[0])[0]
             people = []
 
             if results.boxes is not None and len(results.boxes) > 0:
-                classes = results.boxes.cls.cpu().numpy()
                 coords = results.boxes.xyxy.cpu().numpy().astype(np.int32)
                 
-                for class_id, coord, conf in zip(classes, coords, results.boxes.conf):
-                    if class_id == 0 and conf >= self.confidence:
-                        x1, y1, x2, y2 = coord
-                        people.append((x1, y1, x2, y2, conf))
+                for coord, conf in zip(coords, results.boxes.conf):
+                    x1, y1, x2, y2 = coord
+                    people.append((x1, y1, x2, y2, conf))
             
             return people
             
@@ -157,6 +153,10 @@ class Detection:
                 
                 self.frame_count += 1
                 if self.frame_count % (self.skip_f + 1) != 0:
+                    self.out.write(frame)
+                    small_frame = cv2.resize(frame, self.resize_frame())
+                    cv2.resizeWindow('Video', small_frame.shape[1], small_frame.shape[0])
+                    cv2.imshow('Video', small_frame)
                     continue
                 
                 try:
@@ -198,4 +198,4 @@ class Detection:
                 
             cv2.destroyAllWindows()
             self.logger.info(f"Processing completed")
-            self.logger.info(f"Average total time: {sum(times)/len(times):.2f} ms")
+            self.logger.info(f"Average total time: {sum(times)/(self.frame_count):.2f} ms")

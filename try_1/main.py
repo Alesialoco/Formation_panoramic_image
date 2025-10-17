@@ -1,5 +1,5 @@
 import argparse
-from task1 import Detection
+from video_proc import Detection
 
 def main():
     parser = argparse.ArgumentParser()
