@@ -2,8 +2,7 @@ import cv2
 import numpy as np
 import configparser
 import time
-import os
-from task1.people_detected import PeopleDetector
+from people_detected import PeopleDetector
 
 class VideoStitcher:
     def __init__(self, config_file='config.ini'):
@@ -14,7 +13,7 @@ class VideoStitcher:
 
         self.stitcher = None
 
-        self.overlap_percentage = self.config.getfloat('STITCHING', 'overlap_perceptage', fallback=25.0)
+        self.overlap_percentage = self.config.getfloat('STITCHING', 'overlap_percentage', fallback=25.0)
         self.resolution_width = self.config.getint('STITCHING', 'resolution_width', fallback=640)
         self.resolution_height = self.config.getint('STITCHING', 'resolution_height', fallback=480)
         self.stitch_mode = self.config.get('STITCHING', 'stitch_mode', fallback='SCANS')
@@ -34,7 +33,7 @@ class VideoStitcher:
                 self.stitcher = cv2.Stitcher.create(cv2.Stitcher_SCANS)
                 print('Stitcher инициализирован (режим SCANS)')
             else:
-                self.stitcher = cv2.Stitcher.create(cv2.Stitcher_PANORAMA):
+                self.stitcher = cv2.Stitcher.create(cv2.Stitcher_PANORAMA)
                 print('Stitcher инициализирован (режим PANORAMA)')
             return True
         except Exception as e:
@@ -52,9 +51,9 @@ class VideoStitcher:
                         sources.append(value.strip())
 
             if len(sources) < 2:
-                raise 'Недостаточно источников в конфиге'
+                raise Exception('Недостаточно источников в конфиге')
         except Exception as e:
-            print('Ошибка при подключении к источникам: {e}')
+            print(f'Ошибка при подключении к источникам: {e}')
             return False
 
         success_count = 0
@@ -74,7 +73,7 @@ class VideoStitcher:
         print(f'Успешно подключено к {len(self.caps)} из {len(sources)} источников')
         return success_count >= 2
 
-    def read_frames:
+    def read_frames(self):
         self.frames = []
 
         for i, cap in enumerate(self.caps):
@@ -94,16 +93,17 @@ class VideoStitcher:
 
     def stitch_frames(self):
         if self.stitcher is None:
-            if not self.stitcher_initialized():
+            if not self.initialize_stitcher():
                 return None
 
         try:
             status, panorama = self.stitcher.stitch(self.frames)
 
             if status == cv2.Stitcher_OK:
+                print('Сшивка выполнена успешно')
                 return panorama
             else:
-                raise f'код {status}'
+                raise Exception(f'код {status} != {cv2.Stitcher_OK}')
         except Exception as e:
             print(f'Исключение при сшивке: {e}')
             return None
@@ -117,8 +117,41 @@ class VideoStitcher:
             cv2.putText(panorama_with_detections, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             return panorama_with_detections, detections
         except Exception as e:
-        print(f'Ошибка поиска людей: {e}')
-        return panorama, []
+            print(f'Ошибка поиска людей: {e}')
+            return panorama, []
 
     def run(self):
-        pass
+        if not self.connect_to_streams():
+            return
+
+        print('Запуск панорамной сшивки. Нажмите "q" для выхода')
+        print(f'Параметры: {self.resolution_width}x{self.resolution_height}, overlap: {self.overlap_percentage}%')
+
+        try:
+            while True:
+                if not self.read_frames():
+                    print('Ошибка чтения кадров')
+                    return
+
+                panorama = self.stitch_frames()
+
+                if panorama is not None:
+                    panorama_with_detections, detections = self.detect_people_in_panorama(panorama)
+                    display_frame = cv2.resize(panorama_with_detections, (self.display_width, self.display_height))
+                    cv2.imshow('Panorama - People Detection', display_frame)
+
+                    if self.show_individual_cameras:
+                        for i, frame in enumerate(self.frames):
+                            cv2.imshow(f'Camera {i+1}', frame)
+
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+        except KeyboardInterrupt:
+            print('Программа прервана пользователем')
+        except Exception as e:
+            print(f'Критическая ошибка:')
+        finally:
+            for cap in self.caps:
+                cap.release()
+            cv2.destroyAllWindows()
+            print('Ресурсы освобождены')
