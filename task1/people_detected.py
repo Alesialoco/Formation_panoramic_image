@@ -9,7 +9,7 @@ class PeopleDetector:
             self.config = configparser.ConfigParser()
             self.config.read(config_file)
 
-            model_path = self.config.get('MODEL', 'path', fallback='yolo8n.pt')
+            model_path = self.config.get('MODEL', 'path', fallback='yolov8n.pt')
             print(f'Загрузка модели: {model_path}')
             self.model = YOLO(model_path)
 
