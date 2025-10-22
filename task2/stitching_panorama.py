@@ -1,7 +1,6 @@
 import cv2
 import numpy as np
 import configparser
-import time
 from people_detected import PeopleDetector
 
 class VideoStitcher:
