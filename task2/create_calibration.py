@@ -21,6 +21,10 @@ def calibrate_camera(images_path="chess_desks/*.jpg", output_file="camera_calibr
         else:
             print(f"Ошибка загрузки: {os.path.basename(fname)}")
 
+    if len(images) < 2:
+        print(f'Слишком мало изображений! Найдено {len(images)} изображений')
+        return False
+
     print(f"Загружено {len(images)} изображений для калибровки")
 
     objp = np.zeros((pattern_size[0] * pattern_size[1], 3), np.float32)
