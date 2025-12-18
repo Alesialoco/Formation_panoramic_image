@@ -5,6 +5,7 @@ import os
 import math
 import logging
 import sys
+import time
 
 
 logging.basicConfig(
@@ -21,7 +22,7 @@ class OptimizedCylindricalStitcher:
     
     def __init__(self, video1_path: str, video2_path: str, output_path: str,
                  num_calibration_frames: int = 10, neutral_plane_t: float = 0.5,
-                 fov_horizontal: float = 150):
+                 fov_horizontal: float = 150, use_gpu: bool = True):
         """
         Инициализация класса для сшивки видео
         
@@ -32,7 +33,8 @@ class OptimizedCylindricalStitcher:
             num_calibration_frames: Количество кадров для калибровки гомографии
             neutral_plane_t: Параметр нейтральной плоскости (0-1)
             fov_horizontal: Горизонтальный угол обзора для цилиндрической проекции
-            
+            use_gpu: Использовать ли GPU ускорение
+
         Raises:
             ValueError: Если neutral_plane_t не в диапазоне [0, 1]
         """
@@ -42,12 +44,19 @@ class OptimizedCylindricalStitcher:
         self.num_calibration_frames = num_calibration_frames
         self.neutral_plane_t = neutral_plane_t
         self.fov_horizontal = fov_horizontal
+        self.use_gpu = use_gpu
 
         if not 0 <= neutral_plane_t <= 1:
             logger.error(f"neutral_plane_t должен быть в диапазоне от 0 до 1, получено: {neutral_plane_t}")
             raise ValueError("neutral_plane_t должен быть в диапазоне от 0 до 1")
 
-        # Инициализация детектора и сопоставителя признаков
+        # Инициализация GPU/CPU детекторов
+        self.gpu_available = False
+        self.sift_gpu = None
+        self.matcher_gpu = None
+        self._init_gpu_components()
+        
+        # Инициализация CPU детекторов
         self.sift = cv2.SIFT_create()
         FLANN_INDEX_KDTREE = 1
         index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
@@ -66,13 +75,46 @@ class OptimizedCylindricalStitcher:
         self.blend_mask = None
         self.blend_mask_3d = None
 
-        # Параметры цилиндрической проекции и обрезки
+        # Параметры цилиндрической проекции и обрезки 
         self.cylindrical_map_x = None
         self.cylindrical_map_y = None
         self.horizontal_crop_slices = None
         self.final_crop_slices = None
         self.final_output_size = None
         self.horizontal_crop_percent = 0.30
+        
+        # GPU кэш для оптимизации
+        self.gpu_frame1_cache = None
+        self.gpu_frame2_cache = None
+        self.gpu_cylindrical_map_x = None
+        self.gpu_cylindrical_map_y = None
+
+    def _init_gpu_components(self):
+        """Инициализация GPU компонентов если доступно"""
+        if not self.use_gpu:
+            logger.info("GPU ускорение отключено")
+            return
+            
+        try:
+            cuda_count = cv2.cuda.getCudaEnabledDeviceCount()
+            if cuda_count > 0:
+                logger.info(f"Найдено {cuda_count} CUDA устройств")
+                self.gpu_available = True
+                
+                self.sift_gpu = cv2.cuda.SIFT_create()
+                self.matcher_gpu = cv2.cuda.DescriptorMatcher_createBFMatcher(cv2.NORM_L2)
+                
+                if cv2.ocl.haveOpenCL():
+                    cv2.ocl.setUseOpenCL(True)
+                    logger.info("OpenCL включен")
+                    
+                logger.info("GPU компоненты успешно инициализированы")
+            else:
+                logger.warning("CUDA устройства не найдены, использую CPU")
+                
+        except Exception as e:
+            logger.warning(f"Ошибка инициализации GPU: {e}, использую CPU")
+            self.gpu_available = False
 
     def extract_features(self, image: np.ndarray) -> Tuple[List[cv2.KeyPoint], np.ndarray]:
         """
@@ -86,14 +128,58 @@ class OptimizedCylindricalStitcher:
                 keypoints: Список ключевых точек
                 descriptors: Дескрипторы ключевых точек
         """
+        if self.gpu_available and self.sift_gpu is not None:
+            try:
+                gpu_img = cv2.cuda_GpuMat()
+                gpu_img.upload(image)
+                
+                gray_gpu = cv2.cuda.cvtColor(gpu_img, cv2.COLOR_BGR2GRAY)
+                
+                kp_gpu, descriptors_gpu = self.sift_gpu.detectAndCompute(gray_gpu, None)
+                
+                if kp_gpu is not None and descriptors_gpu is not None:
+                    keypoints = self.sift_gpu.downloadKeypoints(kp_gpu)
+                    descriptors = descriptors_gpu.download()
+                    return keypoints, descriptors
+                    
+            except Exception as e:
+                logger.debug(f"GPU feature extraction failed: {e}, switching to CPU")
+        
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         keypoints, descriptors = self.sift.detectAndCompute(gray, None)
         return keypoints, descriptors
 
+    def match_features(self, desc1: np.ndarray, desc2: np.ndarray):
+        """
+        Сопоставление признаков
+        """
+        if self.gpu_available and desc1 is not None and desc2 is not None:
+            try:
+                gpu_desc1 = cv2.cuda_GpuMat()
+                gpu_desc2 = cv2.cuda_GpuMat()
+                gpu_desc1.upload(desc1)
+                gpu_desc2.upload(desc2)
+                
+                matches_gpu = self.matcher_gpu.knnMatch(gpu_desc1, gpu_desc2, k=2)
+                
+                matches = []
+                for match_pair in matches_gpu:
+                    if len(match_pair) == 2:
+                        m = match_pair[0]
+                        n = match_pair[1]
+                        matches.append([m, n])
+                
+                return matches
+                
+            except Exception as e:
+                logger.debug(f"GPU matching failed: {e}, switching to CPU")
+        
+        return self.flann.knnMatch(desc1, desc2, k=2)
+
     def find_homography(self, img1: np.ndarray, img2: np.ndarray) -> Optional[np.ndarray]:
         """
         Поиск матрицы гомографии между двумя изображениями
-        
+
         Args:
             img1: Первое изображение
             img2: Второе изображение
@@ -108,7 +194,8 @@ class OptimizedCylindricalStitcher:
             logger.warning("Недостаточно дескрипторов для поиска гомографии")
             return None
 
-        matches = self.flann.knnMatch(desc1, desc2, k=2)
+        matches = self.match_features(desc1, desc2)
+        
         good_matches = []
         for match_pair in matches:
             if len(match_pair) == 2:
@@ -126,10 +213,79 @@ class OptimizedCylindricalStitcher:
         H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
         return H
 
+    def warp_perspective_gpu(self, src: np.ndarray, M: np.ndarray, dsize: tuple) -> np.ndarray:
+        """
+        Оптимизированный warpPerspective с GPU поддержкой
+        """
+        if self.gpu_available:
+            try:
+                gpu_src = cv2.cuda_GpuMat()
+                gpu_src.upload(src)
+                
+                warp = cv2.cuda.warpPerspective(gpu_src, M, dsize, flags=cv2.INTER_LINEAR)
+                return warp.download()
+                
+            except Exception as e:
+                logger.debug(f"GPU warp failed: {e}")
+        
+        return cv2.warpPerspective(src, M, dsize, flags=cv2.INTER_LINEAR)
+
+    def warp_perspective_cached(self, src: np.ndarray, M: np.ndarray, dsize: tuple, 
+                               cache_key: str) -> np.ndarray:
+        """
+        Warp с кэшированием GPU объектов
+        """
+        if not self.gpu_available:
+            return cv2.warpPerspective(src, M, dsize, flags=cv2.INTER_LINEAR)
+        
+        try:
+            if cache_key == 'frame1':
+                if self.gpu_frame1_cache is None:
+                    self.gpu_frame1_cache = cv2.cuda_GpuMat()
+                gpu_src = self.gpu_frame1_cache
+            elif cache_key == 'frame2':
+                if self.gpu_frame2_cache is None:
+                    self.gpu_frame2_cache = cv2.cuda_GpuMat()
+                gpu_src = self.gpu_frame2_cache
+            else:
+                gpu_src = cv2.cuda_GpuMat()
+            
+            gpu_src.upload(src)
+            warp = cv2.cuda.warpPerspective(gpu_src, M, dsize, flags=cv2.INTER_LINEAR)
+            return warp.download()
+            
+        except Exception as e:
+            logger.debug(f"Cached GPU warp failed: {e}")
+            return cv2.warpPerspective(src, M, dsize, flags=cv2.INTER_LINEAR)
+
+    def remap_gpu(self, src: np.ndarray, map1: np.ndarray, map2: np.ndarray) -> np.ndarray:
+        """
+        Оптимизированный remap с GPU поддержкой
+        """
+        if self.gpu_available:
+            try:
+                gpu_src = cv2.cuda_GpuMat()
+                gpu_map1 = cv2.cuda_GpuMat()
+                gpu_map2 = cv2.cuda_GpuMat()
+                
+                gpu_src.upload(src)
+                gpu_map1.upload(map1)
+                gpu_map2.upload(map2)
+                
+                result = cv2.cuda.remap(gpu_src, gpu_map1, gpu_map2, 
+                                       interpolation=cv2.INTER_LINEAR)
+                return result.download()
+                
+            except Exception as e:
+                logger.debug(f"GPU remap failed: {e}")
+        
+        return cv2.remap(src, map1, map2, cv2.INTER_LINEAR)
+
+    
     def calculate_homography_from_frames(self) -> None:
         """
         Вычисление матриц гомографии на основе нескольких кадров из видео
-        
+
         Raises:
             Exception: Если не удалось вычислить матрицы гомографии
         """
@@ -196,8 +352,7 @@ class OptimizedCylindricalStitcher:
         logger.info("Вычисление новой гомографии для нейтральной плоскости...")
 
         h2, w2 = frame2.shape[:2]
-        warped2_neutral = cv2.warpPerspective(frame2, self.neutral_transform_2, (w2 * 2, h2 * 2),
-                                             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+        warped2_neutral = self.warp_perspective_gpu(frame2, self.neutral_transform_2, (w2 * 2, h2 * 2))
 
         gray_warped = cv2.cvtColor(warped2_neutral, cv2.COLOR_BGR2GRAY)
         _, thresh = cv2.threshold(gray_warped, 10, 255, cv2.THRESH_BINARY)
@@ -273,10 +428,8 @@ class OptimizedCylindricalStitcher:
             frame1: Первый кадр
             frame2: Второй кадр
         """
-        warped1 = cv2.warpPerspective(frame1, self.final_transform_1, self.output_size,
-                                     flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-        warped2 = cv2.warpPerspective(frame2, self.final_transform_2, self.output_size,
-                                     flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+        warped1 = self.warp_perspective_cached(frame1, self.final_transform_1, self.output_size, 'frame1')
+        warped2 = self.warp_perspective_cached(frame2, self.final_transform_2, self.output_size, 'frame2')
 
         mask1 = (warped1.sum(axis=2) > 10)
         mask2 = (warped2.sum(axis=2) > 10)
@@ -326,7 +479,7 @@ class OptimizedCylindricalStitcher:
     def stitch_frame(self, frame1: np.ndarray, frame2: np.ndarray) -> np.ndarray:
         """
         Сшивка кадра с предварительно вычисленными трансформациями
-        
+
         Args:
             frame1: Первый кадр
             frame2: Второй кадр
@@ -334,10 +487,8 @@ class OptimizedCylindricalStitcher:
         Returns:
             Сшитое изображение
         """
-        warped1 = cv2.warpPerspective(frame1, self.final_transform_1, self.output_size,
-                                     flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-        warped2 = cv2.warpPerspective(frame2, self.final_transform_2, self.output_size,
-                                     flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+        warped1 = self.warp_perspective_cached(frame1, self.final_transform_1, self.output_size, 'frame1')
+        warped2 = self.warp_perspective_cached(frame2, self.final_transform_2, self.output_size, 'frame2')
 
         result = np.zeros((self.output_size[1], self.output_size[0], 3), dtype=np.uint8)
 
@@ -393,6 +544,15 @@ class OptimizedCylindricalStitcher:
         map_x = np.clip(map_x, 0, width - 1)
         map_y = np.clip(map_y, 0, height - 1)
 
+        if self.gpu_available:
+            try:
+                self.gpu_cylindrical_map_x = cv2.cuda_GpuMat()
+                self.gpu_cylindrical_map_y = cv2.cuda_GpuMat()
+                self.gpu_cylindrical_map_x.upload(map_x)
+                self.gpu_cylindrical_map_y.upload(map_y)
+            except Exception as e:
+                logger.debug(f"Не удалось кэшировать GPU maps: {e}")
+
         return map_x, map_y
 
     def cylindrical_projection(self, frame: np.ndarray) -> np.ndarray:
@@ -412,10 +572,21 @@ class OptimizedCylindricalStitcher:
             logger.error("Карты цилиндрической проекции не инициализированы")
             raise ValueError("Карты цилиндрической проекции не инициализированы")
         
-        result = cv2.remap(frame, self.cylindrical_map_x, self.cylindrical_map_y,
-                          cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        return result
-
+        if self.gpu_available and self.gpu_cylindrical_map_x is not None:
+            try:
+                gpu_frame = cv2.cuda_GpuMat()
+                gpu_frame.upload(frame)
+                
+                result = cv2.cuda.remap(gpu_frame, self.gpu_cylindrical_map_x, 
+                                       self.gpu_cylindrical_map_y,
+                                       interpolation=cv2.INTER_LINEAR)
+                return result.download()
+            except Exception as e:
+                logger.debug(f"GPU цилиндрическая проекция не удалась: {e}")
+        
+        return cv2.remap(frame, self.cylindrical_map_x, self.cylindrical_map_y,
+                        cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    
     def find_content_bounds(self, image: np.ndarray, black_threshold: int = 20) -> Tuple[int, int, int, int]:
         """
         Нахождение границ контента в изображении
@@ -705,6 +876,7 @@ class OptimizedCylindricalStitcher:
         logger.info(f"  Частота кадров: {fps:.2f} FPS")
         logger.info(f"  Всего кадров: {total_frames}")
         logger.info(f"  Размер сшивки: {self.output_size[0]}x{self.output_size[1]}")
+        logger.info(f"  GPU ускорение: {'Включено' if self.gpu_available else 'Отключено'}")
 
         logger.info("Анализ первого кадра для определения обрезки...")
         ret1, first_frame1 = cap1.read()
@@ -741,8 +913,8 @@ class OptimizedCylindricalStitcher:
         logger.info(f"  Выходной файл: {final_output_path}")
 
         frame_count = 0
-        import time
         start_time = time.time()
+        stitch_times = []
 
         while True:
             ret1, frame1 = cap1.read()
@@ -752,19 +924,30 @@ class OptimizedCylindricalStitcher:
                 break
 
             try:
+                stitch_start = time.time()
+                
                 stitched = self.stitch_frame(frame1, frame2)
                 cylindrical = self.cylindrical_projection(stitched)
                 cropped_frame = self.apply_crop(cylindrical)
                 final_frame = self.ensure_even_size(cropped_frame, self.final_output_size)
                 final_out.write(final_frame)
+                
+                stitch_time = time.time() - stitch_start
+                stitch_times.append(stitch_time)
+                
                 frame_count += 1
 
                 if frame_count % 50 == 0:
                     elapsed = time.time() - start_time
                     fps_actual = frame_count / elapsed if elapsed > 0 else 0
                     progress = (frame_count / total_frames) * 100
+                    
+                    avg_stitch_time = np.mean(stitch_times[-100:]) if stitch_times else 0
+                    max_stitch_time = np.max(stitch_times[-100:]) if stitch_times else 0
+                    
                     logger.info(f"Обработано: {frame_count}/{total_frames} ({progress:.1f}%), "
-                              f"Скорость: {fps_actual:.1f} FPS")
+                              f"Скорость: {fps_actual:.1f} FPS, "
+                              f"Время сшивки: {avg_stitch_time*1000:.1f}ms (макс: {max_stitch_time*1000:.1f}ms)")
 
             except Exception as e:
                 logger.error(f"Ошибка при обработке кадра {frame_count}: {e}")
@@ -777,12 +960,23 @@ class OptimizedCylindricalStitcher:
 
         total_time = time.time() - start_time
         avg_fps = frame_count / total_time if total_time > 0 else 0
+        
+        if stitch_times:
+            avg_stitch = np.mean(stitch_times) * 1000
+            max_stitch = np.max(stitch_times) * 1000
+            min_stitch = np.min(stitch_times) * 1000
+            std_stitch = np.std(stitch_times) * 1000
+        else:
+            avg_stitch = max_stitch = min_stitch = std_stitch = 0
 
         logger.info(f"Всего кадров: {frame_count}")
         logger.info(f"Общее время: {total_time:.1f} секунд")
         logger.info(f"Средняя скорость: {avg_fps:.1f} FPS")
+        logger.info(f"Производительность сшивки:")
+        logger.info(f"  Среднее: {avg_stitch:.1f}ms, Мин: {min_stitch:.1f}ms, Макс: {max_stitch:.1f}ms, Std: {std_stitch:.1f}ms")
         logger.info(f"Финальный размер: {self.final_output_size[0]}x{self.final_output_size[1]}")
         logger.info(f"Финальный файл: {final_output_path}")
+        logger.info(f"GPU использовалось: {'Да' if self.gpu_available else 'Нет'}")
 
         if os.path.exists(final_output_path):
             file_size = os.path.getsize(final_output_path) / (1024 * 1024)
@@ -848,7 +1042,6 @@ class OptimizedCylindricalStitcher:
         os.makedirs(output_dir, exist_ok=True)
 
         frame_count = 0
-        import time
         start_time = time.time()
 
         while True:
@@ -887,56 +1080,3 @@ class OptimizedCylindricalStitcher:
         logger.info(f"Финальный размер: {self.final_output_size[0]}x{self.final_output_size[1]}")
 
         return output_dir
-
-
-def main():
-    """
-    Основная функция для запуска обработки видео
-    
-    Пример использования:
-        processor = OptimizedCylindricalStitcher(...)
-        result = processor.process_full_pipeline()
-    """
-    video1_path = "v1_change2.8.mp4"
-    video2_path = "v2_dist.mp4"
-    output_path = "final_cylindrical_panorama"
-
-    logger.info(f"Запуск обработки видео:")
-    logger.info(f"  Видео 1: {video1_path}")
-    logger.info(f"  Видео 2: {video2_path}")
-    logger.info(f"  Выходной файл: {output_path}")
-
-    try:
-        processor = OptimizedCylindricalStitcher(
-            video1_path=video1_path,
-            video2_path=video2_path,
-            output_path=output_path,
-            num_calibration_frames=15,
-            neutral_plane_t=0.493,
-            fov_horizontal=150
-        )
-
-        final_video_path = processor.process_full_pipeline()
-
-        if final_video_path:
-            logger.info("=" * 60)
-            logger.info("ОБРАБОТКА ЗАВЕРШЕНА УСПЕШНО!")
-            logger.info("=" * 60)
-
-            if isinstance(final_video_path, str) and final_video_path.endswith(('.mp4', '.avi')):
-                logger.info(f"Видео сохранено: {final_video_path}")
-                logger.info(f"Размер видео: {processor.final_output_size[0]}x{processor.final_output_size[1]}")
-                logger.info("Проверьте файл в медиаплеере (VLC, Windows Media Player)")
-            else:
-                logger.info(f"Кадры сохранены в папку: {final_video_path}")
-                logger.info(f"Размер кадров: {processor.final_output_size[0]}x{processor.final_output_size[1]}")
-        else:
-            logger.error("Ошибка при обработке видео")
-            
-    except Exception as e:
-        logger.error(f"Критическая ошибка при обработке: {e}")
-        raise
-
-
-if __name__ == "__main__":
-    main()
