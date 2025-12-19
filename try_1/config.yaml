@@ -8,7 +8,7 @@ scale: 0.5
 
 save_path: "output.mp4"
 
-stitching_enabled: true
 num_calibration_frames: 10
 neutral_plane_t: 0.49
 fov_horizontal: 150
+use_gpu: true
