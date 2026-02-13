@@ -6,7 +6,6 @@ import os
 import time
 from video_proc import Detection
 from stich import OptimizedCylindricalStitcher
-import torch
 
 
 class CameraCalibration:
@@ -58,19 +57,9 @@ class RealTimeVideoProcessor:
         self.num_calibration_frames = self.config.get('num_calibration_frames', 10)
         self.neutral_plane_t = self.config.get('neutral_plane_t', 0.5)
         self.fov_horizontal = self.config.get('fov_horizontal', 150)
-        self.use_gpu = self.config.get('use_gpu', True)
         
         print(f"Параметры сшивки: кадров для калибровки={self.num_calibration_frames}, "
-              f"t={self.neutral_plane_t}, FOV={self.fov_horizontal}°, PyTorch GPU={self.use_gpu}")
-        
-        if self.use_gpu:
-            if torch.cuda.is_available():
-                print(f"✓ PyTorch GPU доступен: {torch.cuda.get_device_name(0)}")
-                print(f"  CUDA версия: {torch.version.cuda}")
-                print(f"  Память GPU: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-            else:
-                print("⚠ PyTorch GPU запрошен, но недоступен. Использую CPU.")
-                self.use_gpu = False
+              f"t={self.neutral_plane_t}, FOV={self.fov_horizontal}°")
         
         self.calibration = CameraCalibration(calibration_path)
         self.detector = Detection(config_path)
@@ -189,7 +178,7 @@ class RealTimeVideoProcessor:
         return True
     
     def initialize_stitcher(self) -> bool:
-        """Инициализация сшивателя с PyTorch GPU поддержкой"""
+        """Инициализация сшивателя"""
         calib_frames1, calib_frames2 = self.collect_calibration_frames()
         
         if calib_frames1 is None or calib_frames2 is None:
@@ -198,15 +187,14 @@ class RealTimeVideoProcessor:
         if not self.save_calibration_videos(calib_frames1, calib_frames2):
             return False
         
-        print(f"Инициализация сшивателя с PyTorch GPU поддержкой...")
+        print("Инициализация сшивателя...")
         self.stitcher = OptimizedCylindricalStitcher(
             video1_path='calib_video1_temp.mp4',
             video2_path='calib_video2_temp.mp4',
             output_path='temp_output',
             num_calibration_frames=min(5, len(calib_frames1)),
             neutral_plane_t=self.neutral_plane_t,
-            fov_horizontal=self.fov_horizontal,
-            use_gpu=self.use_gpu
+            fov_horizontal=self.fov_horizontal
         )
         
         self.stitcher.initialize_stitching_parameters()
@@ -228,7 +216,6 @@ class RealTimeVideoProcessor:
             os.remove('calib_video2_temp.mp4')
         
         print(f"Сшиватель инициализирован. Финальный размер: {self.stitcher.final_output_size}")
-        print(f"Используется устройство: {self.stitcher.device}")
         return True
     
     def initialize_video_writer(self) -> bool:
@@ -259,7 +246,7 @@ class RealTimeVideoProcessor:
         return True
     
     def process_frame_pair(self, frame1: np.ndarray, frame2: np.ndarray) -> np.ndarray:
-        """Обработка пары кадров с PyTorch GPU ускорением"""
+        """Обработка пары кадров"""
         frame1_undistorted = self.calibration.undistort_image(frame1)
         frame2_undistorted = self.calibration.undistort_image(frame2)
         
@@ -269,7 +256,6 @@ class RealTimeVideoProcessor:
         stitched_frame = self.stitcher.ensure_even_size(
             cropped_frame, self.stitcher.final_output_size
         )
-        
         people = self.detector.process_frame(stitched_frame)
         result_frame = self.detector.drawing(stitched_frame, people)
         
@@ -277,11 +263,9 @@ class RealTimeVideoProcessor:
     
     def run(self):
         """Основной цикл обработки"""
-        print("\n=== Запуск обработки видеопотоков с PyTorch GPU ===")
-        print(f"PyTorch GPU ускорение: {'включено' if self.use_gpu else 'выключено'}")
+        print("\n=== Запуск обработки видеопотоков ===")
         print("Нажмите 'q' для выхода")
         print("Нажмите 'p' для паузы/продолжения")
-        print("Нажмите 's' для сохранения статистики")
         
         if not self.initialize_video_streams():
             print("Ошибка инициализации видеопотоков")
@@ -295,13 +279,12 @@ class RealTimeVideoProcessor:
             print("Ошибка инициализации VideoWriter")
             return
         
-        window_name = "Сшитое видео с детекцией людей (PyTorch GPU)"
+        window_name = "Сшитое видео с детекцией людей"
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_name, self.output_width // 2, self.output_height // 2)
         
         self.start_time = time.time()
         last_stat_time = self.start_time
-        stitch_times = []
     
         is_paused = False
         
@@ -316,10 +299,6 @@ class RealTimeVideoProcessor:
                     is_paused = not is_paused
                     status = "включена" if is_paused else "выключена"
                     print(f"Пауза: {status}")
-                elif key == ord('s'):
-                    if stitch_times:
-                        avg_stitch = np.mean(stitch_times[-100:]) * 1000
-                        print(f"Текущая статистика: среднее время сшивки = {avg_stitch:.1f}ms")
                 
                 if is_paused:
                     time.sleep(0.1)
@@ -339,31 +318,18 @@ class RealTimeVideoProcessor:
                         cv2.imshow(window_name, self.last_result_frame)
                     continue
                 
-                stitch_start = time.time()
                 result_frame = self.process_frame_pair(frame1, frame2)
-                stitch_time = time.time() - stitch_start
-                stitch_times.append(stitch_time)
-                
                 self.last_result_frame = result_frame
                 cv2.imshow(window_name, result_frame)
                 self.video_writer.write(result_frame)
                 self.saved_frames += 1
                 
+                # Вывод статистики каждые 5 секунд
                 current_time = time.time()
                 if current_time - last_stat_time >= 5.0:
                     elapsed = current_time - self.start_time
                     fps = self.saved_frames / elapsed if elapsed > 0 else 0
-                    
-                    if stitch_times:
-                        avg_stitch = np.mean(stitch_times[-100:]) * 1000
-                        max_stitch = np.max(stitch_times[-100:]) * 1000
-                    else:
-                        avg_stitch = max_stitch = 0
-                    
-                    print(f"Обработано: {self.saved_frames} кадров, FPS: {fps:.1f}, "
-                          f"Сшивка: {avg_stitch:.1f}ms (макс: {max_stitch:.1f}ms), "
-                          f"Устройство: {self.stitcher.device}")
-                    
+                    print(f"Обработано: {self.saved_frames} кадров, FPS: {fps:.1f}")
                     last_stat_time = current_time
                 
         except KeyboardInterrupt:
@@ -376,9 +342,6 @@ class RealTimeVideoProcessor:
     def cleanup(self):
         """Очистка ресурсов"""
         print("\nОчистка ресурсов...")
-        
-        if hasattr(self, 'stitcher') and self.stitcher:
-            print(f"PyTorch использовалось устройство: {self.stitcher.device}")
         
         if self.cap1 and self.cap1.isOpened():
             self.cap1.release()
@@ -409,20 +372,17 @@ class RealTimeVideoProcessor:
             print(f"Общее время: {total_time:.1f} секунд")
             print(f"Средний FPS: {avg_fps:.1f}")
             print(f"Размер видео: {self.output_width}x{self.output_height}")
-            if hasattr(self, 'stitcher') and self.stitcher:
-                print(f"PyTorch устройство: {self.stitcher.device}")
         
         print("Обработка завершена")
 
 
 def main():
     """Основная функция"""
-    parser = argparse.ArgumentParser(description='Обработка видеопотоков с PyTorch GPU')
+    parser = argparse.ArgumentParser(description='Обработка видеопотоков')
     parser.add_argument('--config', default='config.yaml', help='Конфигурационный файл')
     parser.add_argument('--calibration', default='calibration_results.npz', 
                        help='Файл калибровки камеры')
     parser.add_argument('--output', help='Выходной файл')
-    parser.add_argument('--no-gpu', action='store_true', help='Отключить PyTorch GPU ускорение')
     
     args = parser.parse_args()
     
@@ -431,9 +391,6 @@ def main():
         
         if args.output:
             processor.output_path = args.output
-        
-        if args.no_gpu:
-            processor.use_gpu = False
             
         processor.run()
     except ValueError as e:
@@ -444,8 +401,6 @@ def main():
         return 1
     except Exception as e:
         print(f"Неожиданная ошибка: {e}")
-        import traceback
-        traceback.print_exc()
         return 1
     
     return 0

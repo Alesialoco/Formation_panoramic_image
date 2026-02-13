@@ -5,10 +5,7 @@ import os
 import math
 import logging
 import sys
-import time
-import torch
-import torch.nn.functional as F
-from torchvision.transforms import functional as TF
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,12 +17,11 @@ logger = logging.getLogger(__name__)
 class OptimizedCylindricalStitcher:
     """
     Класс для сшивки двух видео с цилиндрической проекцией
-    Использует PyTorch для GPU ускорения операций обработки изображений
     """
     
     def __init__(self, video1_path: str, video2_path: str, output_path: str,
                  num_calibration_frames: int = 10, neutral_plane_t: float = 0.5,
-                 fov_horizontal: float = 150, use_gpu: bool = True):
+                 fov_horizontal: float = 150):
         """
         Инициализация класса для сшивки видео
         
@@ -36,7 +32,6 @@ class OptimizedCylindricalStitcher:
             num_calibration_frames: Количество кадров для калибровки гомографии
             neutral_plane_t: Параметр нейтральной плоскости (0-1)
             fov_horizontal: Горизонтальный угол обзора для цилиндрической проекции
-            use_gpu: Использовать ли GPU через PyTorch
             
         Raises:
             ValueError: Если neutral_plane_t не в диапазоне [0, 1]
@@ -47,15 +42,10 @@ class OptimizedCylindricalStitcher:
         self.num_calibration_frames = num_calibration_frames
         self.neutral_plane_t = neutral_plane_t
         self.fov_horizontal = fov_horizontal
-        self.use_gpu = use_gpu
 
         if not 0 <= neutral_plane_t <= 1:
             logger.error(f"neutral_plane_t должен быть в диапазоне от 0 до 1, получено: {neutral_plane_t}")
             raise ValueError("neutral_plane_t должен быть в диапазоне от 0 до 1")
-
-        # Инициализация PyTorch устройства
-        self.device = self._init_torch_device()
-        logger.info(f"Используется устройство: {self.device}")
 
         # Инициализация детектора и сопоставителя признаков
         self.sift = cv2.SIFT_create()
@@ -76,9 +66,6 @@ class OptimizedCylindricalStitcher:
         self.blend_mask = None
         self.blend_mask_3d = None
 
-        # PyTorch версии масок
-        self.blend_mask_torch = None
-
         # Параметры цилиндрической проекции и обрезки
         self.cylindrical_map_x = None
         self.cylindrical_map_y = None
@@ -86,109 +73,6 @@ class OptimizedCylindricalStitcher:
         self.final_crop_slices = None
         self.final_output_size = None
         self.horizontal_crop_percent = 0.30
-
-        # Кэш для PyTorch тензоров
-        self.map_x_tensor = None
-        self.map_y_tensor = None
-
-    def _init_torch_device(self):
-        """Инициализация PyTorch устройства для вычислений"""
-        if self.use_gpu and torch.cuda.is_available():
-            device = torch.device('cuda')
-            logger.info(f"PyTorch GPU доступен: {torch.cuda.get_device_name(0)}")
-            logger.info(f"CUDA версия: {torch.version.cuda}")
-            logger.info(f"Память GPU: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-        else:
-            device = torch.device('cpu')
-            if self.use_gpu:
-                logger.warning("GPU запрошен, но недоступен. Использую CPU.")
-            else:
-                logger.info("Использую CPU (use_gpu=False)")
-        return device
-
-    def numpy_to_torch(self, image: np.ndarray) -> torch.Tensor:
-        """
-        Конвертация numpy изображения в PyTorch tensor
-        
-        Args:
-            image: Входное изображение в формате BGR (H, W, C)
-            
-        Returns:
-            PyTorch tensor в формате (C, H, W) нормализованный [0, 1]
-        """
-        if len(image.shape) == 3 and image.shape[2] == 3:
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        else:
-            image_rgb = image
-            
-        tensor = TF.to_tensor(image_rgb).to(self.device)
-        return tensor
-
-    def torch_to_numpy(self, tensor: torch.Tensor) -> np.ndarray:
-        """
-        Конвертация PyTorch tensor в numpy изображение
-        
-        Args:
-            tensor: PyTorch tensor в формате (C, H, W) [0, 1]
-            
-        Returns:
-            Numpy изображение в формате BGR (H, W, C) [0, 255]
-        """
-        image = (tensor.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-        if image.shape[2] == 3:
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        return image
-
-    def warp_perspective_torch(self, image: np.ndarray, M: np.ndarray, dsize: tuple) -> np.ndarray:
-        """
-        Быстрое perspective warp с использованием PyTorch на GPU
-        
-        Args:
-            image: Входное изображение
-            M: Матрица гомографии 3x3
-            dsize: Размер выходного изображения (width, height)
-            
-        Returns:
-            Выходное изображение после трансформации
-        """
-        h_src, w_src = image.shape[:2]
-        w_dst, h_dst = dsize
-        
-        tensor = self.numpy_to_torch(image)
-        
-        y_dst, x_dst = torch.meshgrid(
-            torch.linspace(0, h_dst - 1, h_dst),
-            torch.linspace(0, w_dst - 1, w_dst),
-            indexing='ij'
-        )
-        
-        ones = torch.ones_like(x_dst)
-        coords_dst = torch.stack([x_dst, y_dst, ones], dim=-1).float().to(self.device)
-        
-        M_tensor = torch.from_numpy(M).float().to(self.device)
-        
-        M_inv = torch.linalg.inv(M_tensor)
-        
-        coords_src = torch.matmul(coords_dst.reshape(-1, 3), M_inv.T)
-        coords_src = coords_src.reshape(h_dst, w_dst, 3)
-        
-        x_src = coords_src[..., 0] / coords_src[..., 2]
-        y_src = coords_src[..., 1] / coords_src[..., 2]
-        
-        x_src_normalized = (x_src / (w_src - 1)) * 2 - 1
-        y_src_normalized = (y_src / (h_src - 1)) * 2 - 1
-        
-        grid = torch.stack([x_src_normalized, y_src_normalized], dim=-1).unsqueeze(0)
-        
-        tensor = tensor.unsqueeze(0) 
-        warped = F.grid_sample(
-            tensor,
-            grid,
-            mode='bilinear',
-            padding_mode='zeros',
-            align_corners=True
-        )
-        return self.torch_to_numpy(warped.squeeze(0))
 
     def extract_features(self, image: np.ndarray) -> Tuple[List[cv2.KeyPoint], np.ndarray]:
         """
@@ -312,7 +196,8 @@ class OptimizedCylindricalStitcher:
         logger.info("Вычисление новой гомографии для нейтральной плоскости...")
 
         h2, w2 = frame2.shape[:2]
-        warped2_neutral = self.warp_perspective_torch(frame2, self.neutral_transform_2, (w2 * 2, h2 * 2))
+        warped2_neutral = cv2.warpPerspective(frame2, self.neutral_transform_2, (w2 * 2, h2 * 2),
+                                             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
 
         gray_warped = cv2.cvtColor(warped2_neutral, cv2.COLOR_BGR2GRAY)
         _, thresh = cv2.threshold(gray_warped, 10, 255, cv2.THRESH_BINARY)
@@ -388,8 +273,10 @@ class OptimizedCylindricalStitcher:
             frame1: Первый кадр
             frame2: Второй кадр
         """
-        warped1 = self.warp_perspective_torch(frame1, self.final_transform_1, self.output_size)
-        warped2 = self.warp_perspective_torch(frame2, self.final_transform_2, self.output_size)
+        warped1 = cv2.warpPerspective(frame1, self.final_transform_1, self.output_size,
+                                     flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+        warped2 = cv2.warpPerspective(frame2, self.final_transform_2, self.output_size,
+                                     flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
 
         mask1 = (warped1.sum(axis=2) > 10)
         mask2 = (warped2.sum(axis=2) > 10)
@@ -435,92 +322,6 @@ class OptimizedCylindricalStitcher:
                 self.blend_mask[:, x] = alpha
 
         self.blend_mask_3d = np.stack([self.blend_mask] * 3, axis=2)
-        
-        self.blend_mask_torch = torch.from_numpy(self.blend_mask).float().to(self.device)
-
-    def stitch_frame_torch(self, frame1: np.ndarray, frame2: np.ndarray) -> np.ndarray:
-        """
-        Сшивка кадра с использованием PyTorch на GPU
-        
-        Args:
-            frame1: Первый кадр
-            frame2: Второй кадр
-            
-        Returns:
-            Сшитое изображение
-        """
-        tensor1 = self.numpy_to_torch(frame1)
-        tensor2 = self.numpy_to_torch(frame2)
-        
-        warped1 = self._apply_transform_torch(tensor1, self.final_transform_1, self.output_size)
-        warped2 = self._apply_transform_torch(tensor2, self.final_transform_2, self.output_size)
-        
-        mask1 = (warped1.sum(dim=0) > 0.01) 
-        mask2 = (warped2.sum(dim=0) > 0.01)
-        
-        result = torch.zeros_like(warped1)
-        
-        result[:, mask1] = warped1[:, mask1]
-        
-        video2_only = mask2 & ~mask1
-        result[:, video2_only] = warped2[:, video2_only]
-        
-        overlap = mask1 & mask2
-        if overlap.any():
-            blend_mask_3d = self.blend_mask_torch.unsqueeze(0).repeat(3, 1, 1)
-            
-            blended = warped1 * (1 - blend_mask_3d) + warped2 * blend_mask_3d
-            result[:, overlap] = blended[:, overlap]
-        
-        return self.torch_to_numpy(result)
-
-    def _apply_transform_torch(self, tensor: torch.Tensor, M: np.ndarray, dsize: tuple) -> torch.Tensor:
-        """
-        Применение трансформации к PyTorch тензору
-        
-        Args:
-            tensor: Входной тензор (C, H_src, W_src)
-            M: Матрица гомографии 3x3
-            dsize: Размер выхода (width, height)
-            
-        Returns:
-            Трансформированный тензор (C, H_dst, W_dst)
-        """
-        c, h_src, w_src = tensor.shape
-        w_dst, h_dst = dsize
-        
-        y_dst, x_dst = torch.meshgrid(
-            torch.linspace(0, h_dst - 1, h_dst),
-            torch.linspace(0, w_dst - 1, w_dst),
-            indexing='ij'
-        )
-        
-        ones = torch.ones_like(x_dst)
-        coords_dst = torch.stack([x_dst, y_dst, ones], dim=-1).float().to(self.device)
-        
-        M_tensor = torch.from_numpy(M).float().to(self.device)
-        M_inv = torch.linalg.inv(M_tensor)
-        
-        coords_src = torch.matmul(coords_dst.reshape(-1, 3), M_inv.T)
-        coords_src = coords_src.reshape(h_dst, w_dst, 3)
-        
-        x_src = coords_src[..., 0] / coords_src[..., 2]
-        y_src = coords_src[..., 1] / coords_src[..., 2]
-        
-        x_src_normalized = (x_src / (w_src - 1)) * 2 - 1
-        y_src_normalized = (y_src / (h_src - 1)) * 2 - 1
-        
-        grid = torch.stack([x_src_normalized, y_src_normalized], dim=-1).unsqueeze(0)
-        
-        warped = F.grid_sample(
-            tensor.unsqueeze(0),
-            grid,
-            mode='bilinear',
-            padding_mode='zeros',
-            align_corners=True
-        )
-        
-        return warped.squeeze(0)
 
     def stitch_frame(self, frame1: np.ndarray, frame2: np.ndarray) -> np.ndarray:
         """
@@ -533,9 +334,6 @@ class OptimizedCylindricalStitcher:
         Returns:
             Сшитое изображение
         """
-        if self.use_gpu and torch.cuda.is_available():
-            return self.stitch_frame_torch(frame1, frame2)
-        
         warped1 = cv2.warpPerspective(frame1, self.final_transform_1, self.output_size,
                                      flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
         warped2 = cv2.warpPerspective(frame2, self.final_transform_2, self.output_size,
@@ -594,47 +392,12 @@ class OptimizedCylindricalStitcher:
 
         map_x = np.clip(map_x, 0, width - 1)
         map_y = np.clip(map_y, 0, height - 1)
-        
-        self.map_x_tensor = torch.from_numpy(map_x).float().to(self.device)
-        self.map_y_tensor = torch.from_numpy(map_y).float().to(self.device)
 
         return map_x, map_y
 
-    def cylindrical_projection_torch(self, frame: np.ndarray) -> np.ndarray:
-        """
-        Цилиндрическая проекция с использованием PyTorch на GPU
-        
-        Args:
-            frame: Входное изображение
-            
-        Returns:
-            Изображение после цилиндрической проекции
-        """
-        if self.map_x_tensor is None or self.map_y_tensor is None:
-            logger.error("Карты цилиндрической проекции не инициализированы")
-            raise ValueError("Карты цилиндрической проекции не инициализированы")
-        
-        tensor = self.numpy_to_torch(frame)
-        c, h, w = tensor.shape
-        
-        x_norm = (self.map_x_tensor / (w - 1)) * 2 - 1
-        y_norm = (self.map_y_tensor / (h - 1)) * 2 - 1
-        
-        grid = torch.stack([x_norm, y_norm], dim=-1).unsqueeze(0)
-        
-        result = F.grid_sample(
-            tensor.unsqueeze(0),
-            grid,
-            mode='bilinear',
-            padding_mode='zeros',
-            align_corners=True
-        )
-        
-        return self.torch_to_numpy(result.squeeze(0))
-
     def cylindrical_projection(self, frame: np.ndarray) -> np.ndarray:
         """
-        Быстрая цилиндрическая проекция
+        Быстрая цилиндрическая проекция с использованием LUT
         
         Args:
             frame: Входное изображение
@@ -648,9 +411,6 @@ class OptimizedCylindricalStitcher:
         if self.cylindrical_map_x is None or self.cylindrical_map_y is None:
             logger.error("Карты цилиндрической проекции не инициализированы")
             raise ValueError("Карты цилиндрической проекции не инициализированы")
-        
-        if self.use_gpu and torch.cuda.is_available() and self.map_x_tensor is not None:
-            return self.cylindrical_projection_torch(frame)
         
         result = cv2.remap(frame, self.cylindrical_map_x, self.cylindrical_map_y,
                           cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
@@ -945,7 +705,6 @@ class OptimizedCylindricalStitcher:
         logger.info(f"  Частота кадров: {fps:.2f} FPS")
         logger.info(f"  Всего кадров: {total_frames}")
         logger.info(f"  Размер сшивки: {self.output_size[0]}x{self.output_size[1]}")
-        logger.info(f"  Устройство PyTorch: {self.device}")
 
         logger.info("Анализ первого кадра для определения обрезки...")
         ret1, first_frame1 = cap1.read()
@@ -980,12 +739,10 @@ class OptimizedCylindricalStitcher:
         logger.info(f"Начинаю обработку {total_frames} кадров...")
         logger.info(f"  Финальный размер: {self.final_output_size[0]}x{self.final_output_size[1]}")
         logger.info(f"  Выходной файл: {final_output_path}")
-        logger.info(f"  Используется устройство: {self.device}")
 
         frame_count = 0
         import time
         start_time = time.time()
-        stitch_times = []
 
         while True:
             ret1, frame1 = cap1.read()
@@ -995,33 +752,19 @@ class OptimizedCylindricalStitcher:
                 break
 
             try:
-                stitch_start = time.time()
-                
                 stitched = self.stitch_frame(frame1, frame2)
                 cylindrical = self.cylindrical_projection(stitched)
                 cropped_frame = self.apply_crop(cylindrical)
                 final_frame = self.ensure_even_size(cropped_frame, self.final_output_size)
                 final_out.write(final_frame)
-                
-                stitch_time = time.time() - stitch_start
-                stitch_times.append(stitch_time)
-                
                 frame_count += 1
 
                 if frame_count % 50 == 0:
                     elapsed = time.time() - start_time
                     fps_actual = frame_count / elapsed if elapsed > 0 else 0
                     progress = (frame_count / total_frames) * 100
-                    
-                    if stitch_times:
-                        avg_stitch = np.mean(stitch_times[-100:]) * 1000
-                        max_stitch = np.max(stitch_times[-100:]) * 1000
-                    else:
-                        avg_stitch = max_stitch = 0
-                    
                     logger.info(f"Обработано: {frame_count}/{total_frames} ({progress:.1f}%), "
-                              f"Скорость: {fps_actual:.1f} FPS, "
-                              f"Сшивка: {avg_stitch:.1f}ms (макс: {max_stitch:.1f}ms)")
+                              f"Скорость: {fps_actual:.1f} FPS")
 
             except Exception as e:
                 logger.error(f"Ошибка при обработке кадра {frame_count}: {e}")
@@ -1034,22 +777,12 @@ class OptimizedCylindricalStitcher:
 
         total_time = time.time() - start_time
         avg_fps = frame_count / total_time if total_time > 0 else 0
-        
-        if stitch_times:
-            avg_stitch = np.mean(stitch_times) * 1000
-            max_stitch = np.max(stitch_times) * 1000
-            min_stitch = np.min(stitch_times) * 1000
-        else:
-            avg_stitch = max_stitch = min_stitch = 0
 
         logger.info(f"Всего кадров: {frame_count}")
         logger.info(f"Общее время: {total_time:.1f} секунд")
         logger.info(f"Средняя скорость: {avg_fps:.1f} FPS")
-        logger.info(f"Производительность сшивки:")
-        logger.info(f"  Среднее: {avg_stitch:.1f}ms, Мин: {min_stitch:.1f}ms, Макс: {max_stitch:.1f}ms")
         logger.info(f"Финальный размер: {self.final_output_size[0]}x{self.final_output_size[1]}")
         logger.info(f"Финальный файл: {final_output_path}")
-        logger.info(f"Устройство: {self.device}")
 
         if os.path.exists(final_output_path):
             file_size = os.path.getsize(final_output_path) / (1024 * 1024)
@@ -1154,3 +887,4 @@ class OptimizedCylindricalStitcher:
         logger.info(f"Финальный размер: {self.final_output_size[0]}x{self.final_output_size[1]}")
 
         return output_dir
+
