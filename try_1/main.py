@@ -58,8 +58,13 @@ class RealTimeVideoProcessor:
         self.neutral_plane_t = self.config.get('neutral_plane_t', 0.5)
         self.fov_horizontal = self.config.get('fov_horizontal', 150)
         
+        self.adaptive_smoothness = self.config.get('adaptive_smoothness', 50.0)
+        self.crop_percent = self.config.get('crop_percent', 0.15)
+        
         print(f"Параметры сшивки: кадров для калибровки={self.num_calibration_frames}, "
-              f"t={self.neutral_plane_t}, FOV={self.fov_horizontal}°")
+              f"t={self.neutral_plane_t}, FOV={self.fov_horizontal}°, "
+              f"гладкость={self.adaptive_smoothness}, "
+              f"обрезка боков={self.crop_percent*100:.1f}%")
         
         self.calibration = CameraCalibration(calibration_path)
         self.detector = Detection(config_path)
@@ -76,7 +81,6 @@ class RealTimeVideoProcessor:
     def initialize_video_streams(self) -> bool:
         """Инициализация видеопотоков"""
         self.cap1 = cv2.VideoCapture(self.video1_url)
-        
         self.cap2 = cv2.VideoCapture(self.video2_url)
         
         if not self.cap1.isOpened():
@@ -194,7 +198,9 @@ class RealTimeVideoProcessor:
             output_path='temp_output',
             num_calibration_frames=min(5, len(calib_frames1)),
             neutral_plane_t=self.neutral_plane_t,
-            fov_horizontal=self.fov_horizontal
+            fov_horizontal=self.fov_horizontal,
+            adaptive_smoothness=self.adaptive_smoothness,
+            crop_percent=self.crop_percent
         )
         
         self.stitcher.initialize_stitching_parameters()
@@ -203,13 +209,16 @@ class RealTimeVideoProcessor:
         test_frame2 = calib_frames2[0]
         test_stitched = self.stitcher.stitch_frame(test_frame1, test_frame2)
         
-        self.stitcher.cylindrical_map_x, self.stitcher.cylindrical_map_y = \
+        
+        self.stitcher.projection_map_x, self.stitcher.projection_map_y = \
             self.stitcher.create_cylindrical_map(
                 self.stitcher.output_size[0], self.stitcher.output_size[1]
-            )
+        )
         
-        self.stitcher.analyze_and_compute_crop(test_stitched)
+        # Анализируем и вычисляем параметры обработки
+        self.stitcher.analyze_and_compute_crop_params(test_stitched)
         
+        # Удаляем временные файлы
         if os.path.exists('calib_video1_temp.mp4'):
             os.remove('calib_video1_temp.mp4')
         if os.path.exists('calib_video2_temp.mp4'):
@@ -223,10 +232,11 @@ class RealTimeVideoProcessor:
         self.output_width = self.stitcher.final_output_size[0]
         self.output_height = self.stitcher.final_output_size[1]
         
+        # Убеждаемся, что размеры четные
         if self.output_width % 2 != 0:
-            self.output_width += 1
+            self.output_width -= 1
         if self.output_height % 2 != 0:
-            self.output_height += 1
+            self.output_height -= 1
         
         print(f"Инициализация VideoWriter для файла: {self.output_path}")
         print(f"Размер видео: {self.output_width}x{self.output_height}, FPS: {self.fps}")
@@ -247,17 +257,23 @@ class RealTimeVideoProcessor:
     
     def process_frame_pair(self, frame1: np.ndarray, frame2: np.ndarray) -> np.ndarray:
         """Обработка пары кадров"""
+        # Удаление дисторсии
         frame1_undistorted = self.calibration.undistort_image(frame1)
         frame2_undistorted = self.calibration.undistort_image(frame2)
         
+        # Сшивка кадров
         stitched = self.stitcher.stitch_frame(frame1_undistorted, frame2_undistorted)
-        cylindrical = self.stitcher.cylindrical_projection(stitched)
-        cropped_frame = self.stitcher.apply_crop(cylindrical)
-        stitched_frame = self.stitcher.ensure_even_size(
-            cropped_frame, self.stitcher.final_output_size
-        )
-        people = self.detector.process_frame(stitched_frame)
-        result_frame = self.detector.drawing(stitched_frame, people)
+        
+        # Полный пайплайн обработки (проекция + обрезка + масштабирование)
+        processed_frame = self.stitcher.process_frame_full_pipeline(stitched)
+        
+        # Финальная проверка размера
+        if (processed_frame.shape[1], processed_frame.shape[0]) != self.stitcher.final_output_size:
+            processed_frame = cv2.resize(processed_frame, self.stitcher.final_output_size)
+        
+        # Детекция людей
+        people = self.detector.process_frame(processed_frame)
+        result_frame = self.detector.drawing(processed_frame, people)
         
         return result_frame
     
