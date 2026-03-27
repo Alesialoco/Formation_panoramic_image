@@ -92,6 +92,12 @@ class OptimizedCylindricalStitcher:
         self.crop_top = 0
         self.crop_bottom = 0
         self.cropped_size = None
+        
+        # Минимальная высота после адаптивного масштабирования
+        self.min_height = 150
+        
+        # Процент центральной области для анализа границ (0.8 = 80%)
+        self.center_analysis_percent = 0.8
 
     def extract_features(self, image: np.ndarray) -> Tuple[List[cv2.KeyPoint], np.ndarray]:
         """
@@ -493,7 +499,13 @@ class OptimizedCylindricalStitcher:
 
     def analyze_panorama_boundaries(self, panorama: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Анализ верхней и нижней границ панорамы
+        Анализ верхней и нижней границ панорамы для всех столбцов
+        
+        Args:
+            panorama: Входная панорама
+            
+        Returns:
+            Кортеж (top_boundary, bottom_boundary) - границы для каждого столбца
         """
         h, w = panorama.shape[:2]
         
@@ -515,6 +527,39 @@ class OptimizedCylindricalStitcher:
                 bottom_boundary[col] = h - 1
         
         return top_boundary, bottom_boundary
+
+    def compute_target_height_from_center(self, top_boundary: np.ndarray, bottom_boundary: np.ndarray, w: int) -> int:
+        """
+        Вычисление целевой высоты только по центральной области
+        
+        Args:
+            top_boundary: Массив верхних границ для всех столбцов
+            bottom_boundary: Массив нижних границ для всех столбцов
+            w: Ширина изображения
+            
+        Returns:
+            Целевая высота
+        """
+        # Определяем центральную область
+        center_start = int(w * (1 - self.center_analysis_percent) / 2)
+        center_end = int(w * (1 + self.center_analysis_percent) / 2)
+        
+        # Берем границы только из центральной области
+        center_top = top_boundary[center_start:center_end]
+        center_bottom = bottom_boundary[center_start:center_end]
+        
+        # Вычисляем целевую высоту по центральной области
+        target_top = np.max(center_top)
+        target_bottom = np.min(center_bottom)
+        target_height = int(target_bottom - target_top)
+        
+        logger.info(f"Вычисление целевой высоты по центральной области:")
+        logger.info(f"  Столбцы {center_start}-{center_end} из {w} (центральные {self.center_analysis_percent*100:.0f}%)")
+        logger.info(f"  Максимальная верхняя граница в центре: {target_top:.0f}")
+        logger.info(f"  Минимальная нижняя граница в центре: {target_bottom:.0f}")
+        logger.info(f"  Целевая высота: {target_height} пикселей")
+        
+        return target_height
 
     def smooth_boundaries(self, top_boundary: np.ndarray, bottom_boundary: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -538,19 +583,22 @@ class OptimizedCylindricalStitcher:
         return top_smooth, bottom_smooth
 
     def create_adaptive_height_map(self, panorama: np.ndarray, top_smooth: np.ndarray, 
-                                   bottom_smooth: np.ndarray) -> Tuple[np.ndarray, np.ndarray, int]:
+                                   bottom_smooth: np.ndarray, target_height: int) -> Tuple[np.ndarray, np.ndarray]:
         """
         Создание карты трансформации для адаптивного масштабирования по высоте
+        
+        Args:
+            panorama: Исходная панорама
+            top_smooth: Сглаженные верхние границы
+            bottom_smooth: Сглаженные нижние границы
+            target_height: Целевая высота (уже вычислена)
+            
+        Returns:
+            Кортеж (map_x, map_y) - карты трансформации
         """
         h, w = panorama.shape[:2]
         
-        target_top = np.max(top_smooth)
-        target_bottom = np.min(bottom_smooth)
-        target_height = int(target_bottom - target_top)
-        
-        if target_height % 2 != 0:
-            target_height += 1
-        
+        # Создаем карты трансформации для всего изображения
         map_x = np.zeros((target_height, w), dtype=np.float32)
         map_y = np.zeros((target_height, w), dtype=np.float32)
         
@@ -571,7 +619,7 @@ class OptimizedCylindricalStitcher:
                 map_x[row, col] = col
                 map_y[row, col] = src_y
         
-        return map_x, map_y, target_height
+        return map_x, map_y
 
     def apply_adaptive_scaling(self, panorama: np.ndarray) -> np.ndarray:
         """
@@ -579,17 +627,38 @@ class OptimizedCylindricalStitcher:
         """
         h, w = panorama.shape[:2]
         
+        # Анализируем границы для всех столбцов
         top, bottom = self.analyze_panorama_boundaries(panorama)
+        
+        # Вычисляем целевую высоту ТОЛЬКО по центральной области
+        target_height = self.compute_target_height_from_center(top, bottom, w)
+        
+        # Применяем минимальную отметку высоты
+        original_target_height = target_height
+        if target_height < self.min_height:
+            target_height = self.min_height
+            logger.warning(f"Высота после адаптивного масштабирования была {original_target_height}px, "
+                          f"увеличена до минимальной {self.min_height}px")
+        
+        # Убеждаемся, что высота четная
+        if target_height % 2 != 0:
+            target_height += 1
+            logger.debug(f"Высота скорректирована до четной: {target_height}")
+        
+        logger.info(f"Итоговая целевая высота: {target_height} пикселей")
+        
+        # Сглаживаем границы для плавного перехода
         top_smooth, bottom_smooth = self.smooth_boundaries(top, bottom)
         
         self.top_boundary_smooth = top_smooth
         self.bottom_boundary_smooth = bottom_smooth
+        self.target_height = target_height
         
-        map_x, map_y, target_height = self.create_adaptive_height_map(
-            panorama, top_smooth, bottom_smooth
+        # Создаем карты трансформации с единой целевой высотой для всех столбцов
+        map_x, map_y = self.create_adaptive_height_map(
+            panorama, top_smooth, bottom_smooth, target_height
         )
         
-        self.target_height = target_height
         self.adaptive_map_x = map_x
         self.adaptive_map_y = map_y
         
@@ -613,6 +682,8 @@ class OptimizedCylindricalStitcher:
         """
         logger.info("Анализ первого кадра для определения параметров обработки...")
         logger.info(f"Процент обрезки боков: {self.crop_percent * 100:.1f}%")
+        logger.info(f"Минимальная высота после масштабирования: {self.min_height}px")
+        logger.info(f"Центральная область для определения высоты: {self.center_analysis_percent * 100:.0f}%")
         
         # Шаг 1: Применяем проекцию
         projected_frame = self.apply_projection(stitched_frame)
@@ -673,7 +744,6 @@ class OptimizedCylindricalStitcher:
                 borderValue=0
             )
         else:
-            print("Second")
             scaled = self.apply_adaptive_scaling(borders_removed)
 
         # Шаг 5: Проверка четности размеров
@@ -736,7 +806,6 @@ class OptimizedCylindricalStitcher:
         logger.info(f"  Частота кадров: {fps:.2f} FPS")
         logger.info(f"  Всего кадров: {total_frames}")
         logger.info(f"  Размер сшивки: {self.output_size[0]}x{self.output_size[1]}")
-        logger.info(f"  Тип проекции: {self.projection_type}")
         logger.info(f"  Параметр гладкости: {self.adaptive_smoothness}")
         logger.info(f"  Процент обрезки боков: {self.crop_percent * 100:.1f}%")
 
