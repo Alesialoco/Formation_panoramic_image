@@ -1,10 +1,12 @@
 import cv2
 import numpy as np
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Dict
 import os
 import math
 import logging
 import sys
+from scipy.ndimage import gaussian_filter1d
+from scipy.interpolate import interp1d
 
 
 logging.basicConfig(
@@ -21,7 +23,8 @@ class OptimizedCylindricalStitcher:
     
     def __init__(self, video1_path: str, video2_path: str, output_path: str,
                  num_calibration_frames: int = 10, neutral_plane_t: float = 0.5,
-                 fov_horizontal: float = 150):
+                 fov_horizontal: float = 150, adaptive_smoothness: float = 50.0, 
+                 crop_percent: float = 0.15):
         """
         Инициализация класса для сшивки видео
         
@@ -31,7 +34,9 @@ class OptimizedCylindricalStitcher:
             output_path: Путь для сохранения результата
             num_calibration_frames: Количество кадров для калибровки гомографии
             neutral_plane_t: Параметр нейтральной плоскости (0-1)
-            fov_horizontal: Горизонтальный угол обзора для цилиндрической проекции
+            fov_horizontal: Горизонтальный угол обзора для проекции
+            adaptive_smoothness: Параметр гладкости для адаптивного масштабирования (1-100)
+            crop_percent: Процент обрезки с каждой стороны (0.0-0.5)
             
         Raises:
             ValueError: Если neutral_plane_t не в диапазоне [0, 1]
@@ -42,6 +47,8 @@ class OptimizedCylindricalStitcher:
         self.num_calibration_frames = num_calibration_frames
         self.neutral_plane_t = neutral_plane_t
         self.fov_horizontal = fov_horizontal
+        self.adaptive_smoothness = adaptive_smoothness
+        self.crop_percent = max(0.0, min(0.5, crop_percent))  # Ограничиваем от 0 до 0.5
 
         if not 0 <= neutral_plane_t <= 1:
             logger.error(f"neutral_plane_t должен быть в диапазоне от 0 до 1, получено: {neutral_plane_t}")
@@ -66,25 +73,35 @@ class OptimizedCylindricalStitcher:
         self.blend_mask = None
         self.blend_mask_3d = None
 
-        # Параметры цилиндрической проекции и обрезки
-        self.cylindrical_map_x = None
-        self.cylindrical_map_y = None
-        self.horizontal_crop_slices = None
-        self.final_crop_slices = None
+        # Параметры проекции и адаптивного масштабирования
+        self.projection_map_x = None
+        self.projection_map_y = None
+        self.adaptive_params = None
         self.final_output_size = None
-        self.horizontal_crop_percent = 0.30
+        
+        # Параметры для адаптивного масштабирования
+        self.top_boundary_smooth = None
+        self.bottom_boundary_smooth = None
+        self.target_height = None
+        self.adaptive_map_x = None
+        self.adaptive_map_y = None
+        
+        # Параметры для обрезки
+        self.crop_left = 0
+        self.crop_right = 0
+        self.crop_top = 0
+        self.crop_bottom = 0
+        self.cropped_size = None
+        
+        # Минимальная высота после адаптивного масштабирования
+        self.min_height = 150
+        
+        # Процент центральной области для анализа границ (0.8 = 80%)
+        self.center_analysis_percent = 0.8
 
     def extract_features(self, image: np.ndarray) -> Tuple[List[cv2.KeyPoint], np.ndarray]:
         """
         Извлечение признаков SIFT из изображения
-        
-        Args:
-            image: Входное изображение в формате BGR
-            
-        Returns:
-            Кортеж (keypoints, descriptors):
-                keypoints: Список ключевых точек
-                descriptors: Дескрипторы ключевых точек
         """
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         keypoints, descriptors = self.sift.detectAndCompute(gray, None)
@@ -93,13 +110,6 @@ class OptimizedCylindricalStitcher:
     def find_homography(self, img1: np.ndarray, img2: np.ndarray) -> Optional[np.ndarray]:
         """
         Поиск матрицы гомографии между двумя изображениями
-        
-        Args:
-            img1: Первое изображение
-            img2: Второе изображение
-            
-        Returns:
-            Матрица гомографии 3x3 или None, если не удалось найти
         """
         kp1, desc1 = self.extract_features(img1)
         kp2, desc2 = self.extract_features(img2)
@@ -129,9 +139,6 @@ class OptimizedCylindricalStitcher:
     def calculate_homography_from_frames(self) -> None:
         """
         Вычисление матриц гомографии на основе нескольких кадров из видео
-        
-        Raises:
-            Exception: Если не удалось вычислить матрицы гомографии
         """
         logger.info("Вычисление матриц гомографии...")
         
@@ -169,9 +176,6 @@ class OptimizedCylindricalStitcher:
     def neutral_plane_transform(self) -> np.ndarray:
         """
         Создание преобразования для нейтральной плоскости
-        
-        Returns:
-            Матрица преобразования 3x3 для нейтральной плоскости
         """
         logger.info(f"Создание преобразования для нейтральной плоскости (t={self.neutral_plane_t})...")
 
@@ -185,13 +189,6 @@ class OptimizedCylindricalStitcher:
     def calculate_new_homography_to_neutral_plane(self, frame1: np.ndarray, frame2: np.ndarray) -> None:
         """
         Вычисление новой гомографии к нейтральной плоскости
-        
-        Args:
-            frame1: Первый кадр
-            frame2: Второй кадр
-            
-        Raises:
-            Exception: Если не удалось найти контент или вычислить гомографию
         """
         logger.info("Вычисление новой гомографии для нейтральной плоскости...")
 
@@ -230,10 +227,6 @@ class OptimizedCylindricalStitcher:
     def calculate_final_transforms(self, frame1: np.ndarray, frame2: np.ndarray) -> None:
         """
         Вычисление финальных трансформаций для сшивки
-        
-        Args:
-            frame1: Первый кадр
-            frame2: Второй кадр
         """
         h1, w1 = frame1.shape[:2]
         h2, w2 = frame2.shape[:2]
@@ -268,10 +261,6 @@ class OptimizedCylindricalStitcher:
     def precompute_blend_mask(self, frame1: np.ndarray, frame2: np.ndarray) -> None:
         """
         Предварительное вычисление маски для плавного смешивания
-        
-        Args:
-            frame1: Первый кадр
-            frame2: Второй кадр
         """
         warped1 = cv2.warpPerspective(frame1, self.final_transform_1, self.output_size,
                                      flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
@@ -326,13 +315,6 @@ class OptimizedCylindricalStitcher:
     def stitch_frame(self, frame1: np.ndarray, frame2: np.ndarray) -> np.ndarray:
         """
         Сшивка кадра с предварительно вычисленными трансформациями
-        
-        Args:
-            frame1: Первый кадр
-            frame2: Второй кадр
-            
-        Returns:
-            Сшитое изображение
         """
         warped1 = cv2.warpPerspective(frame1, self.final_transform_1, self.output_size,
                                      flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
@@ -358,13 +340,6 @@ class OptimizedCylindricalStitcher:
     def create_cylindrical_map(self, width: int, height: int) -> Tuple[np.ndarray, np.ndarray]:
         """
         Создание LUT (Look-Up Table) для цилиндрической проекции
-        
-        Args:
-            width: Ширина изображения
-            height: Высота изображения
-            
-        Returns:
-            Кортеж (map_x, map_y) для использования в cv2.remap
         """
         f = width / (2 * math.tan(math.radians(self.fov_horizontal / 2)))
 
@@ -395,211 +370,540 @@ class OptimizedCylindricalStitcher:
 
         return map_x, map_y
 
-    def cylindrical_projection(self, frame: np.ndarray) -> np.ndarray:
+    def apply_projection(self, frame: np.ndarray) -> np.ndarray:
         """
-        Быстрая цилиндрическая проекция с использованием LUT
-        
-        Args:
-            frame: Входное изображение
-            
-        Returns:
-            Изображение после цилиндрической проекции
-            
-        Raises:
-            ValueError: Если карты проекции не инициализированы
+        Применение проекции (цилиндрической или сферической) с использованием LUT
         """
-        if self.cylindrical_map_x is None or self.cylindrical_map_y is None:
-            logger.error("Карты цилиндрической проекции не инициализированы")
-            raise ValueError("Карты цилиндрической проекции не инициализированы")
+        if self.projection_map_x is None or self.projection_map_y is None:
+            logger.error("Карты проекции не инициализированы")
+            raise ValueError("Карты проекции не инициализированы")
         
-        result = cv2.remap(frame, self.cylindrical_map_x, self.cylindrical_map_y,
+        result = cv2.remap(frame, self.projection_map_x, self.projection_map_y,
                           cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
         return result
 
-    def find_content_bounds(self, image: np.ndarray, black_threshold: int = 20) -> Tuple[int, int, int, int]:
+    def remove_black_borders(self, image: np.ndarray, threshold: int = 10) -> Tuple[int, int, int, int]:
         """
-        Нахождение границ контента в изображении
+        Удаление черных границ вокруг изображения
         
         Args:
             image: Входное изображение
-            black_threshold: Порог для определения черных пикселей
+            threshold: Порог для определения черных пикселей
             
         Returns:
-            Кортеж (left, top, right, bottom) границ контента
+            Кортеж (left, top, right, bottom) - координаты для обрезки
         """
+        h, w = image.shape[:2]
+        
+        # Конвертируем в градации серого
         if len(image.shape) == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             gray = image
-
-        height, width = gray.shape
-
-        mask = gray > black_threshold
-
+        
+        # Создаем маску нечерных пикселей
+        mask = gray > threshold
+        
         if not np.any(mask):
-            logger.warning("Все пиксели черные, возвращаю полный кадр")
-            return 0, 0, width, height
-
+            logger.warning("Изображение полностью черное, возвращаю исходные границы")
+            return 0, 0, w, h
+        
+        # Находим границы по вертикали и горизонтали
         col_sums = np.sum(mask, axis=0)
         row_sums = np.sum(mask, axis=1)
-
+        
+        # Левая граница
         left = 0
-        for i in range(width):
+        for i in range(w):
             if col_sums[i] > 0:
                 left = i
                 break
-
-        right = width - 1
-        for i in range(width - 1, -1, -1):
+        
+        # Правая граница
+        right = w - 1
+        for i in range(w - 1, -1, -1):
             if col_sums[i] > 0:
                 right = i
                 break
-
+        
+        # Верхняя граница
         top = 0
-        for i in range(height):
+        for i in range(h):
             if row_sums[i] > 0:
                 top = i
                 break
-
-        bottom = height - 1
-        for i in range(height - 1, -1, -1):
+        
+        # Нижняя граница
+        bottom = h - 1
+        for i in range(h - 1, -1, -1):
             if row_sums[i] > 0:
                 bottom = i
                 break
-
-        padding = 5
-        left = max(0, left - padding)
-        right = min(width, right + padding)
-        top = max(0, top - padding)
-        bottom = min(height, bottom + padding)
-
-        if right <= left:
-            left, right = 0, width
-        if bottom <= top:
-            top, bottom = 0, height
-
+        
+        # Добавляем небольшой отступ для безопасности
+        margin = 2
+        left = max(0, left - margin)
+        top = max(0, top - margin)
+        right = min(w, right + margin)
+        bottom = min(h, bottom + margin)
+        
+        logger.debug(f"Границы контента: left={left}, top={top}, right={right}, bottom={bottom}")
+        
         return left, top, right, bottom
 
-    def analyze_and_compute_crop(self, stitched_frame: np.ndarray) -> None:
+    def apply_side_crop(self, image: np.ndarray) -> np.ndarray:
         """
-        Анализ первого кадра для определения параметров обрезки
+        Применение обрезки боковых артефактов по заданному проценту
+        
+        Args:
+            image: Входное изображение
+            
+        Returns:
+            Изображение с обрезанными боками
+        """
+        h, w = image.shape[:2]
+        
+        # Вычисляем количество пикселей для обрезки с каждой стороны
+        crop_pixels = int(w * self.crop_percent)
+        
+        # Применяем обрезку
+        if crop_pixels > 0 and w > 2 * crop_pixels:
+            cropped = image[:, crop_pixels:w - crop_pixels]
+            logger.debug(f"Обрезка боков: {crop_pixels} пикселей с каждой стороны")
+            return cropped
+        else:
+            logger.warning(f"Слишком большой процент обрезки ({self.crop_percent}), пропускаю")
+            return image
+
+    def ensure_even_size_crop(self, image: np.ndarray) -> np.ndarray:
+        """
+        Обрезка изображения до четных размеров
+        
+        Args:
+            image: Входное изображение
+            
+        Returns:
+            Изображение с четными размерами
+        """
+        h, w = image.shape[:2]
+        
+        new_w = w if w % 2 == 0 else w - 1
+        new_h = h if h % 2 == 0 else h - 1
+        
+        if new_w != w or new_h != h:
+            # Обрезаем до четных размеров
+            image = image[:new_h, :new_w]
+            logger.debug(f"Коррекция до четных размеров: {new_w}x{new_h}")
+        
+        return image
+
+    def analyze_panorama_boundaries(self, panorama: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Анализ верхней и нижней границ панорамы для всех столбцов
+        
+        Args:
+            panorama: Входная панорама
+            
+        Returns:
+            Кортеж (top_boundary, bottom_boundary) - границы для каждого столбца
+        """
+        h, w = panorama.shape[:2]
+        
+        gray = cv2.cvtColor(panorama, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+        
+        top_boundary = np.zeros(w)
+        bottom_boundary = np.zeros(w)
+        
+        for col in range(w):
+            col_data = binary[:, col]
+            non_zero = np.where(col_data > 0)[0]
+            
+            if len(non_zero) > 0:
+                top_boundary[col] = non_zero[0]
+                bottom_boundary[col] = non_zero[-1]
+            else:
+                top_boundary[col] = 0
+                bottom_boundary[col] = h - 1
+        
+        return top_boundary, bottom_boundary
+
+    def compute_target_height_from_center(self, top_boundary: np.ndarray, bottom_boundary: np.ndarray, w: int) -> int:
+        """
+        Вычисление целевой высоты только по центральной области
+        
+        Args:
+            top_boundary: Массив верхних границ для всех столбцов
+            bottom_boundary: Массив нижних границ для всех столбцов
+            w: Ширина изображения
+            
+        Returns:
+            Целевая высота
+        """
+        # Определяем центральную область
+        center_start = int(w * (1 - self.center_analysis_percent) / 2)
+        center_end = int(w * (1 + self.center_analysis_percent) / 2)
+        
+        # Берем границы только из центральной области
+        center_top = top_boundary[center_start:center_end]
+        center_bottom = bottom_boundary[center_start:center_end]
+        
+        # Вычисляем целевую высоту по центральной области
+        target_top = np.max(center_top)
+        target_bottom = np.min(center_bottom)
+        target_height = int(target_bottom - target_top)
+        
+        logger.info(f"Вычисление целевой высоты по центральной области:")
+        logger.info(f"  Столбцы {center_start}-{center_end} из {w} (центральные {self.center_analysis_percent*100:.0f}%)")
+        logger.info(f"  Максимальная верхняя граница в центре: {target_top:.0f}")
+        logger.info(f"  Минимальная нижняя граница в центре: {target_bottom:.0f}")
+        logger.info(f"  Целевая высота: {target_height} пикселей")
+        
+        return target_height
+
+    def smooth_boundaries(self, top_boundary: np.ndarray, bottom_boundary: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Сглаживание границ с заданным уровнем гладкости
+        """
+        h = len(top_boundary)
+        sigma = self.adaptive_smoothness / 5.0
+        
+        top_smooth = gaussian_filter1d(top_boundary, sigma=sigma, mode='reflect')
+        bottom_smooth = gaussian_filter1d(bottom_boundary, sigma=sigma, mode='reflect')
+        
+        top_smooth = np.clip(top_smooth, 0, h-1)
+        bottom_smooth = np.clip(bottom_smooth, 0, h-1)
+        
+        for i in range(len(top_smooth)):
+            if top_smooth[i] >= bottom_smooth[i]:
+                mid = (top_boundary[i] + bottom_boundary[i]) / 2
+                top_smooth[i] = mid - 10
+                bottom_smooth[i] = mid + 10
+        
+        return top_smooth, bottom_smooth
+
+    def create_adaptive_height_map(self, panorama: np.ndarray, top_smooth: np.ndarray, 
+                                   bottom_smooth: np.ndarray, target_height: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Создание карты трансформации для адаптивного масштабирования по высоте
+        
+        Args:
+            panorama: Исходная панорама
+            top_smooth: Сглаженные верхние границы
+            bottom_smooth: Сглаженные нижние границы
+            target_height: Целевая высота (уже вычислена)
+            
+        Returns:
+            Кортеж (map_x, map_y) - карты трансформации
+        """
+        h, w = panorama.shape[:2]
+        
+        # Создаем карты трансформации для всего изображения
+        map_x = np.zeros((target_height, w), dtype=np.float32)
+        map_y = np.zeros((target_height, w), dtype=np.float32)
+        
+        for col in range(w):
+            current_top = top_smooth[col]
+            current_bottom = bottom_smooth[col]
+            current_height = current_bottom - current_top
+            
+            if current_height <= 0:
+                current_height = target_height
+            
+            scale = target_height / current_height
+            
+            for row in range(target_height):
+                src_y = current_top + (row / scale)
+                src_y = np.clip(src_y, 0, h-1)
+                
+                map_x[row, col] = col
+                map_y[row, col] = src_y
+        
+        return map_x, map_y
+
+    def apply_adaptive_scaling(self, panorama: np.ndarray) -> np.ndarray:
+        """
+        Применение адаптивного масштабирования к панораме
+        """
+        h, w = panorama.shape[:2]
+        
+        # Анализируем границы для всех столбцов
+        top, bottom = self.analyze_panorama_boundaries(panorama)
+        
+        # Вычисляем целевую высоту ТОЛЬКО по центральной области
+        target_height = self.compute_target_height_from_center(top, bottom, w)
+        
+        # Применяем минимальную отметку высоты
+        original_target_height = target_height
+        if target_height < self.min_height:
+            target_height = self.min_height
+            logger.warning(f"Высота после адаптивного масштабирования была {original_target_height}px, "
+                          f"увеличена до минимальной {self.min_height}px")
+        
+        # Убеждаемся, что высота четная
+        if target_height % 2 != 0:
+            target_height += 1
+            logger.debug(f"Высота скорректирована до четной: {target_height}")
+        
+        logger.info(f"Итоговая целевая высота: {target_height} пикселей")
+        
+        # Сглаживаем границы для плавного перехода
+        top_smooth, bottom_smooth = self.smooth_boundaries(top, bottom)
+        
+        self.top_boundary_smooth = top_smooth
+        self.bottom_boundary_smooth = bottom_smooth
+        self.target_height = target_height
+        
+        # Создаем карты трансформации с единой целевой высотой для всех столбцов
+        map_x, map_y = self.create_adaptive_height_map(
+            panorama, top_smooth, bottom_smooth, target_height
+        )
+        
+        self.adaptive_map_x = map_x
+        self.adaptive_map_y = map_y
+        
+        result = cv2.remap(
+            panorama, 
+            map_x.astype(np.float32), 
+            map_y.astype(np.float32), 
+            cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0
+        )
+        
+        return result
+
+    def analyze_and_compute_crop_params(self, stitched_frame: np.ndarray) -> None:
+        """
+        Анализ первого кадра для определения всех параметров обрезки и масштабирования
         
         Args:
             stitched_frame: Сшитый кадр для анализа
         """
-        logger.info("Анализ первого кадра для определения обрезки...")
+        logger.info("Анализ первого кадра для определения параметров обработки...")
+        logger.info(f"Процент обрезки боков: {self.crop_percent * 100:.1f}%")
+        logger.info(f"Минимальная высота после масштабирования: {self.min_height}px")
+        logger.info(f"Центральная область для определения высоты: {self.center_analysis_percent * 100:.0f}%")
         
-        height, width = stitched_frame.shape[:2]
-        logger.info(f"Исходный размер сшитого кадра: {width}x{height}")
-
-        cylindrical_frame = self.cylindrical_projection(stitched_frame)
-
-        crop_percent = self.horizontal_crop_percent
-        crop_left = int(width * crop_percent)
-        crop_right = int(width * crop_percent)
-
-        x1 = crop_left
-        y1 = 0
-        x2 = width - crop_right
-        y2 = height
-
-        x1 = max(0, x1)
-        x2 = min(width, x2)
-        y1 = max(0, y1)
-        y2 = min(height, y2)
-
-        horizontal_cropped = cylindrical_frame[y1:y2, x1:x2]
-        self.horizontal_crop_slices = {
-            'x_slice': slice(x1, x2),
-            'y_slice': slice(y1, y2)
-        }
-
-        left, top, right, bottom = self.find_content_bounds(horizontal_cropped, black_threshold=15)
-
-        min_width = 100
-        min_height = 100
-
-        if (right - left) < min_width:
-            center_x = (left + right) // 2
-            left = max(0, center_x - min_width // 2)
-            right = min(horizontal_cropped.shape[1], left + min_width)
-
-        if (bottom - top) < min_height:
-            center_y = (top + bottom) // 2
-            top = max(0, center_y - min_height // 2)
-            bottom = min(horizontal_cropped.shape[0], top + min_height)
-
-        self.final_crop_slices = {
-            'x_slice': slice(left, right),
-            'y_slice': slice(top, bottom)
-        }
-
-        final_width = right - left
-        final_height = bottom - top
-
-        final_width = final_width if final_width % 2 == 0 else final_width - 1
-        final_height = final_height if final_height % 2 == 0 else final_height - 1
+        # Шаг 1: Применяем проекцию
+        projected_frame = self.apply_projection(stitched_frame)
+        logger.info(f"После проекции: {projected_frame.shape[1]}x{projected_frame.shape[0]}")
         
-        final_width = max(min_width, final_width)
-        final_height = max(min_height, final_height)
+        # Шаг 2: Применяем обрезку боковых артефактов
+        side_cropped = self.apply_side_crop(projected_frame)
+        logger.info(f"После обрезки боков: {side_cropped.shape[1]}x{side_cropped.shape[0]}")
         
-        if final_width % 2 != 0:
-            final_width += 1
-        if final_height % 2 != 0:
-            final_height += 1
+        # Шаг 3: Удаляем черные границы
+        left, top, right, bottom = self.remove_black_borders(side_cropped)
+        self.crop_left, self.crop_top, self.crop_right, self.crop_bottom = left, top, right, bottom
+        
+        borders_removed = side_cropped[top:bottom, left:right]
+        logger.info(f"После удаления черных границ: {borders_removed.shape[1]}x{borders_removed.shape[0]}")
+        
+        # Шаг 4: Применяем адаптивное масштабирование по высоте
+        scaled = self.apply_adaptive_scaling(borders_removed)
+        logger.info(f"После адаптивного масштабирования: {scaled.shape[1]}x{scaled.shape[0]}")
 
-        self.final_output_size = (final_width, final_height)
+        # Шаг 5: Проверяем четность размеров
+        final = self.ensure_even_size_crop(scaled)
+        
+        self.final_output_size = (final.shape[1], final.shape[0])
+        
+        logger.info(f"Финальный размер после всех этапов: {self.final_output_size[0]}x{self.final_output_size[1]}")
 
-        logger.info(f"Финальный размер (четный): {final_width}x{final_height}")
-
-    def apply_crop(self, cylindrical_frame: np.ndarray) -> np.ndarray:
+    def process_frame_full_pipeline(self, frame: np.ndarray) -> np.ndarray:
         """
-        Применение двухэтапной обрезки к кадру
+        Полный пайплайн обработки одного кадра
         
         Args:
-            cylindrical_frame: Изображение после цилиндрической проекции
+            frame: Входной кадр
             
         Returns:
-            Обрезанное изображение
+            Обработанный кадр
         """
-        if self.horizontal_crop_slices is None or self.final_crop_slices is None:
-            logger.warning("Срезы для обрезки не определены, возвращаю исходный кадр")
-            return cylindrical_frame
-
-        horizontally_cropped = cylindrical_frame[
-            self.horizontal_crop_slices['y_slice'],
-            self.horizontal_crop_slices['x_slice']
+        # Шаг 1: Проекция
+        projected = self.apply_projection(frame)
+        
+        # Шаг 2: Обрезка боковых артефактов
+        side_cropped = self.apply_side_crop(projected)
+        
+        # Шаг 3: Удаление черных границ (используем предвычисленные координаты)
+        borders_removed = side_cropped[
+            self.crop_top:self.crop_bottom, 
+            self.crop_left:self.crop_right
         ]
+        
+        # Шаг 4: Адаптивное масштабирование (используем предвычисленные карты)
+        if self.adaptive_map_x is not None and self.adaptive_map_y is not None:
+            scaled = cv2.remap(
+                borders_removed,
+                self.adaptive_map_x.astype(np.float32),
+                self.adaptive_map_y.astype(np.float32),
+                cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0
+            )
+        else:
+            scaled = self.apply_adaptive_scaling(borders_removed)
 
-        final_cropped = horizontally_cropped[
-            self.final_crop_slices['y_slice'],
-            self.final_crop_slices['x_slice']
-        ]
+        # Шаг 5: Проверка четности размеров
+        final = self.ensure_even_size_crop(scaled)
+        
+        return final
 
-        return final_cropped
+    def initialize_stitching_parameters(self) -> None:
+        """
+        Инициализация всех параметров сшивки
+        """
+        logger.info("Инициализация параметров сшивки...")
+        
+        self.calculate_homography_from_frames()
+
+        cap1 = cv2.VideoCapture(self.video1_path)
+        cap2 = cv2.VideoCapture(self.video2_path)
+
+        ret1, frame1 = cap1.read()
+        ret2, frame2 = cap2.read()
+
+        if not ret1 or not ret2:
+            logger.error("Не удалось прочитать кадры для инициализации")
+            raise Exception("Не удалось прочитать кадры для инициализации")
+
+        self.neutral_transform_2 = self.neutral_plane_transform()
+        self.calculate_new_homography_to_neutral_plane(frame1, frame2)
+        self.calculate_final_transforms(frame1, frame2)
+        self.precompute_blend_mask(frame1, frame2)
+
+        cap1.release()
+        cap2.release()
+
+        logger.info("Параметры сшивки инициализированы!")
+
+    def process_full_pipeline(self) -> str:
+        """
+        Полный пайплайн обработки видео
+        """
+        self.initialize_stitching_parameters()
+
+        cap1 = cv2.VideoCapture(self.video1_path)
+        cap2 = cv2.VideoCapture(self.video2_path)
+
+        fps1 = cap1.get(cv2.CAP_PROP_FPS)
+        fps2 = cap2.get(cv2.CAP_PROP_FPS)
+        fps = min(fps1, fps2)
+        if fps <= 0:
+            fps = 30.0
+            logger.warning(f"Не удалось определить FPS, использую значение по умолчанию: {fps}")
+            
+        total_frames = int(min(
+            cap1.get(cv2.CAP_PROP_FRAME_COUNT),
+            cap2.get(cv2.CAP_PROP_FRAME_COUNT)
+        ))
+
+        logger.info(f"Параметры видео:")
+        logger.info(f"  Видео 1: {self.video1_path}")
+        logger.info(f"  Видео 2: {self.video2_path}")
+        logger.info(f"  Частота кадров: {fps:.2f} FPS")
+        logger.info(f"  Всего кадров: {total_frames}")
+        logger.info(f"  Размер сшивки: {self.output_size[0]}x{self.output_size[1]}")
+        logger.info(f"  Параметр гладкости: {self.adaptive_smoothness}")
+        logger.info(f"  Процент обрезки боков: {self.crop_percent * 100:.1f}%")
+
+        logger.info("Анализ первого кадра для определения параметров обработки...")
+        ret1, first_frame1 = cap1.read()
+        ret2, first_frame2 = cap2.read()
+
+        if not ret1 or not ret2:
+            logger.error("Не удалось прочитать первые кадры")
+            raise Exception("Не удалось прочитать первые кадры")
+
+        first_stitched = self.stitch_frame(first_frame1, first_frame2)
+        
+        logger.info("Создание карт для проекции...")
+        self.projection_map_x, self.projection_map_y = self.create_cylindrical_map(
+            self.output_size[0], self.output_size[1])
+        
+        # Анализируем и вычисляем все параметры обработки
+        self.analyze_and_compute_crop_params(first_stitched)
+
+        cap1.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        cap2.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+        logger.info("Создание выходного видеофайла...")
+        try:
+            final_out, final_output_path = self.create_video_writer(
+                self.output_path, fps, self.final_output_size
+            )
+        except Exception as e:
+            logger.error(f"Не удалось создать VideoWriter: {e}")
+            logger.info("Пробую сохранение как изображений...")
+            return self.save_as_images(cap1, cap2, total_frames)
+
+        logger.info(f"Начинаю обработку {total_frames} кадров...")
+        logger.info(f"  Финальный размер: {self.final_output_size[0]}x{self.final_output_size[1]}")
+        logger.info(f"  Выходной файл: {final_output_path}")
+
+        frame_count = 0
+        import time
+        start_time = time.time()
+
+        while True:
+            ret1, frame1 = cap1.read()
+            ret2, frame2 = cap2.read()
+
+            if not ret1 or not ret2:
+                break
+
+            try:
+                stitched = self.stitch_frame(frame1, frame2)
+                processed_frame = self.process_frame_full_pipeline(stitched)
+                
+                # Финальная проверка размера
+                if (processed_frame.shape[1], processed_frame.shape[0]) != self.final_output_size:
+                    processed_frame = cv2.resize(processed_frame, self.final_output_size)
+                
+                final_out.write(processed_frame)
+                frame_count += 1
+
+                if frame_count % 50 == 0:
+                    elapsed = time.time() - start_time
+                    fps_actual = frame_count / elapsed if elapsed > 0 else 0
+                    progress = (frame_count / total_frames) * 100
+                    logger.info(f"Обработано: {frame_count}/{total_frames} ({progress:.1f}%), "
+                              f"Скорость: {fps_actual:.1f} FPS")
+
+            except Exception as e:
+                logger.error(f"Ошибка при обработке кадра {frame_count}: {e}")
+                continue
+
+        logger.info("Завершение обработки...")
+        cap1.release()
+        cap2.release()
+        final_out.release()
+
+        total_time = time.time() - start_time
+        avg_fps = frame_count / total_time if total_time > 0 else 0
+
+        logger.info(f"Всего кадров: {frame_count}")
+        logger.info(f"Общее время: {total_time:.1f} секунд")
+        logger.info(f"Средняя скорость: {avg_fps:.1f} FPS")
+        logger.info(f"Финальный размер: {self.final_output_size[0]}x{self.final_output_size[1]}")
+        logger.info(f"Финальный файл: {final_output_path}")
+
+        return final_output_path
 
     def create_video_writer(self, output_path: str, fps: float, size: tuple) -> Tuple[cv2.VideoWriter, str]:
         """
         Создание VideoWriter с надежным кодеком
-        
-        Args:
-            output_path: Путь для сохранения видео
-            fps: Частота кадров
-            size: Размер видео (ширина, высота)
-            
-        Returns:
-            Кортеж (VideoWriter, путь к файлу)
-            
-        Raises:
-            Exception: Если не удалось создать VideoWriter
         """
         width, height = size
         
+        # Убеждаемся, что размеры четные
         if width % 2 != 0:
-            width += 1
+            width -= 1
             logger.info(f"Исправлена ширина: {width}")
         if height % 2 != 0:
-            height += 1
+            height -= 1
             logger.info(f"Исправлена высота: {height}")
             
         size = (width, height)
@@ -655,13 +959,6 @@ class OptimizedCylindricalStitcher:
     def ensure_even_size(self, frame: np.ndarray, target_size: tuple) -> np.ndarray:
         """
         Приведение кадра к целевому размеру
-        
-        Args:
-            frame: Входное изображение
-            target_size: Целевой размер (ширина, высота)
-            
-        Returns:
-            Изображение целевого размера
         """
         current_height, current_width = frame.shape[:2]
         target_width, target_height = target_size
@@ -672,175 +969,9 @@ class OptimizedCylindricalStitcher:
         logger.debug(f"Изменение размера с {current_width}x{current_height} на {target_width}x{target_height}")
         return cv2.resize(frame, target_size, interpolation=cv2.INTER_LINEAR)
 
-    def process_full_pipeline(self) -> str:
-        """
-        Полный пайплайн обработки видео
-        
-        Returns:
-            Путь к созданному видеофайлу или папке с изображениями
-            
-        Raises:
-            Exception: Если возникают критические ошибки
-        """
-        self.initialize_stitching_parameters()
-
-        cap1 = cv2.VideoCapture(self.video1_path)
-        cap2 = cv2.VideoCapture(self.video2_path)
-
-        fps1 = cap1.get(cv2.CAP_PROP_FPS)
-        fps2 = cap2.get(cv2.CAP_PROP_FPS)
-        fps = min(fps1, fps2)
-        if fps <= 0:
-            fps = 30.0
-            logger.warning(f"Не удалось определить FPS, использую значение по умолчанию: {fps}")
-            
-        total_frames = int(min(
-            cap1.get(cv2.CAP_PROP_FRAME_COUNT),
-            cap2.get(cv2.CAP_PROP_FRAME_COUNT)
-        ))
-
-        logger.info(f"Параметры видео:")
-        logger.info(f"  Видео 1: {self.video1_path}")
-        logger.info(f"  Видео 2: {self.video2_path}")
-        logger.info(f"  Частота кадров: {fps:.2f} FPS")
-        logger.info(f"  Всего кадров: {total_frames}")
-        logger.info(f"  Размер сшивки: {self.output_size[0]}x{self.output_size[1]}")
-
-        logger.info("Анализ первого кадра для определения обрезки...")
-        ret1, first_frame1 = cap1.read()
-        ret2, first_frame2 = cap2.read()
-
-        if not ret1 or not ret2:
-            logger.error("Не удалось прочитать первые кадры")
-            raise Exception("Не удалось прочитать первые кадры")
-
-        first_stitched = self.stitch_frame(first_frame1, first_frame2)
-        
-        logger.info("Создание карт для цилиндрической проекции...")
-        self.cylindrical_map_x, self.cylindrical_map_y = self.create_cylindrical_map(
-            self.output_size[0], self.output_size[1]
-        )
-        
-        self.analyze_and_compute_crop(first_stitched)
-
-        cap1.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        cap2.set(cv2.CAP_PROP_POS_FRAMES, 0)
-
-        logger.info("Создание выходного видеофайла...")
-        try:
-            final_out, final_output_path = self.create_video_writer(
-                self.output_path, fps, self.final_output_size
-            )
-        except Exception as e:
-            logger.error(f"Не удалось создать VideoWriter: {e}")
-            logger.info("Пробую сохранение как изображений...")
-            return self.save_as_images(cap1, cap2, total_frames)
-
-        logger.info(f"Начинаю обработку {total_frames} кадров...")
-        logger.info(f"  Финальный размер: {self.final_output_size[0]}x{self.final_output_size[1]}")
-        logger.info(f"  Выходной файл: {final_output_path}")
-
-        frame_count = 0
-        import time
-        start_time = time.time()
-
-        while True:
-            ret1, frame1 = cap1.read()
-            ret2, frame2 = cap2.read()
-
-            if not ret1 or not ret2:
-                break
-
-            try:
-                stitched = self.stitch_frame(frame1, frame2)
-                cylindrical = self.cylindrical_projection(stitched)
-                cropped_frame = self.apply_crop(cylindrical)
-                final_frame = self.ensure_even_size(cropped_frame, self.final_output_size)
-                final_out.write(final_frame)
-                frame_count += 1
-
-                if frame_count % 50 == 0:
-                    elapsed = time.time() - start_time
-                    fps_actual = frame_count / elapsed if elapsed > 0 else 0
-                    progress = (frame_count / total_frames) * 100
-                    logger.info(f"Обработано: {frame_count}/{total_frames} ({progress:.1f}%), "
-                              f"Скорость: {fps_actual:.1f} FPS")
-
-            except Exception as e:
-                logger.error(f"Ошибка при обработке кадра {frame_count}: {e}")
-                continue
-
-        logger.info("Завершение обработки...")
-        cap1.release()
-        cap2.release()
-        final_out.release()
-
-        total_time = time.time() - start_time
-        avg_fps = frame_count / total_time if total_time > 0 else 0
-
-        logger.info(f"Всего кадров: {frame_count}")
-        logger.info(f"Общее время: {total_time:.1f} секунд")
-        logger.info(f"Средняя скорость: {avg_fps:.1f} FPS")
-        logger.info(f"Финальный размер: {self.final_output_size[0]}x{self.final_output_size[1]}")
-        logger.info(f"Финальный файл: {final_output_path}")
-
-        if os.path.exists(final_output_path):
-            file_size = os.path.getsize(final_output_path) / (1024 * 1024)
-            logger.info(f"Размер файла: {file_size:.2f} MB")
-            
-            test_cap = cv2.VideoCapture(final_output_path)
-            if test_cap.isOpened():
-                test_frames = int(test_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                test_width = int(test_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                test_height = int(test_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                test_cap.release()
-                logger.info("Файл успешно открыт OpenCV")
-                logger.info(f"  Кадров: {test_frames}, Размер: {test_width}x{test_height}")
-            else:
-                logger.warning("Файл создан, но OpenCV не может его открыть")
-                logger.info("Попробуйте открыть в медиаплеере (VLC, Windows Media Player)")
-
-        return final_output_path
-
-    def initialize_stitching_parameters(self) -> None:
-        """
-        Инициализация всех параметров сшивки
-        """
-        logger.info("Инициализация параметров сшивки...")
-        
-        self.calculate_homography_from_frames()
-
-        cap1 = cv2.VideoCapture(self.video1_path)
-        cap2 = cv2.VideoCapture(self.video2_path)
-
-        ret1, frame1 = cap1.read()
-        ret2, frame2 = cap2.read()
-
-        if not ret1 or not ret2:
-            logger.error("Не удалось прочитать кадры для инициализации")
-            raise Exception("Не удалось прочитать кадры для инициализации")
-
-        self.neutral_transform_2 = self.neutral_plane_transform()
-        self.calculate_new_homography_to_neutral_plane(frame1, frame2)
-        self.calculate_final_transforms(frame1, frame2)
-        self.precompute_blend_mask(frame1, frame2)
-
-        cap1.release()
-        cap2.release()
-
-        logger.info("Параметры сшивки инициализированы!")
-
     def save_as_images(self, cap1, cap2, total_frames):
         """
         Сохранение кадров как изображений (fallback метод)
-        
-        Args:
-            cap1: VideoCapture для первого видео
-            cap2: VideoCapture для второго видео
-            total_frames: Общее количество кадров
-            
-        Returns:
-            Путь к папке с сохраненными изображениями
         """
         logger.info("Использую fallback: сохранение кадров как изображений...")
 
@@ -860,12 +991,14 @@ class OptimizedCylindricalStitcher:
 
             try:
                 stitched = self.stitch_frame(frame1, frame2)
-                cylindrical = self.cylindrical_projection(stitched)
-                cropped_frame = self.apply_crop(cylindrical)
-                final_frame = self.ensure_even_size(cropped_frame, self.final_output_size)
+                processed_frame = self.process_frame_full_pipeline(stitched)
+                
+                # Финальная проверка размера
+                if (processed_frame.shape[1], processed_frame.shape[0]) != self.final_output_size:
+                    processed_frame = cv2.resize(processed_frame, self.final_output_size)
 
                 frame_filename = os.path.join(output_dir, f"frame_{frame_count:06d}.jpg")
-                cv2.imwrite(frame_filename, final_frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                cv2.imwrite(frame_filename, processed_frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
 
                 frame_count += 1
 
@@ -887,4 +1020,3 @@ class OptimizedCylindricalStitcher:
         logger.info(f"Финальный размер: {self.final_output_size[0]}x{self.final_output_size[1]}")
 
         return output_dir
-
