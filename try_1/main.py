@@ -5,7 +5,7 @@ import yaml
 import os
 import time
 from video_proc import Detection
-from stich import OptimizedCylindricalStitcher
+from stich import OptimizedCylindricalStitcher, StitchingParameters
 
 
 class CameraCalibration:
@@ -38,7 +38,8 @@ class CameraCalibration:
 class RealTimeVideoProcessor:
     """Основной класс для обработки видеопотоков"""
     
-    def __init__(self, config_path: str, calibration_path: str = 'calibration_results.npz'):
+    def __init__(self, config_path: str, calibration_path: str = 'calibration_results.npz',
+                 mode: str = 'process', calibration_file: str = 'stitching_params.pkl'):
         with open(config_path, 'r', encoding="utf-8") as file:
             self.config = yaml.safe_load(file)
         
@@ -61,6 +62,10 @@ class RealTimeVideoProcessor:
         self.adaptive_smoothness = self.config.get('adaptive_smoothness', 50.0)
         self.crop_percent = self.config.get('crop_percent', 0.15)
         
+        self.mode = mode
+        self.calibration_file = calibration_file
+        
+        print(f"Режим работы: {'калибровка' if mode == 'calibrate' else 'обработка'}")
         print(f"Параметры сшивки: кадров для калибровки={self.num_calibration_frames}, "
               f"t={self.neutral_plane_t}, FOV={self.fov_horizontal}°, "
               f"гладкость={self.adaptive_smoothness}, "
@@ -181,17 +186,25 @@ class RealTimeVideoProcessor:
         
         return True
     
-    def initialize_stitcher(self) -> bool:
-        """Инициализация сшивателя"""
+    def run_calibration(self):
+        """Запуск режима калибровки"""
+        print("\n=== Запуск калибровки сшивки ===")
+        
+        if not self.initialize_video_streams():
+            print("Ошибка инициализации видеопотоков")
+            return
+        
         calib_frames1, calib_frames2 = self.collect_calibration_frames()
         
         if calib_frames1 is None or calib_frames2 is None:
-            return False
+            print("Ошибка сбора кадров для калибровки")
+            return
         
         if not self.save_calibration_videos(calib_frames1, calib_frames2):
-            return False
+            print("Ошибка сохранения калибровочных видео")
+            return
         
-        print("Инициализация сшивателя...")
+        print("Инициализация сшивателя для калибровки...")
         self.stitcher = OptimizedCylindricalStitcher(
             video1_path='calib_video1_temp.mp4',
             video2_path='calib_video2_temp.mp4',
@@ -203,26 +216,41 @@ class RealTimeVideoProcessor:
             crop_percent=self.crop_percent
         )
         
-        self.stitcher.initialize_stitching_parameters()
-        
-        test_frame1 = calib_frames1[0]
-        test_frame2 = calib_frames2[0]
-        test_stitched = self.stitcher.stitch_frame(test_frame1, test_frame2)
-        
-        
-        self.stitcher.projection_map_x, self.stitcher.projection_map_y = \
-            self.stitcher.create_cylindrical_map(
-                self.stitcher.output_size[0], self.stitcher.output_size[1]
-        )
-        
-        # Анализируем и вычисляем параметры обработки
-        self.stitcher.analyze_and_compute_crop_params(test_stitched)
+        # Выполняем калибровку и сохраняем параметры
+        self.stitcher.calibrate(self.calibration_file)
         
         # Удаляем временные файлы
         if os.path.exists('calib_video1_temp.mp4'):
             os.remove('calib_video1_temp.mp4')
         if os.path.exists('calib_video2_temp.mp4'):
             os.remove('calib_video2_temp.mp4')
+        
+        # Закрываем видеопотоки
+        if self.cap1:
+            self.cap1.release()
+        if self.cap2:
+            self.cap2.release()
+        
+        print(f"\nКалибровка завершена успешно!")
+        print(f"Параметры сохранены в: {self.calibration_file}")
+    
+    def initialize_stitcher_from_file(self) -> bool:
+        """Инициализация сшивателя из файла параметров"""
+        if not os.path.exists(self.calibration_file):
+            print(f"Ошибка: Файл параметров не найден: {self.calibration_file}")
+            print("Сначала выполните калибровку с параметром --mode calibrate")
+            return False
+        
+        print(f"Загрузка параметров из {self.calibration_file}...")
+        params = StitchingParameters.load(self.calibration_file)
+        
+        self.stitcher = OptimizedCylindricalStitcher(
+            fov_horizontal=params.fov_horizontal,
+            adaptive_smoothness=params.adaptive_smoothness,
+            crop_percent=params.crop_percent
+        )
+        
+        self.stitcher.set_parameters(params)
         
         print(f"Сшиватель инициализирован. Финальный размер: {self.stitcher.final_output_size}")
         return True
@@ -261,15 +289,8 @@ class RealTimeVideoProcessor:
         frame1_undistorted = self.calibration.undistort_image(frame1)
         frame2_undistorted = self.calibration.undistort_image(frame2)
         
-        # Сшивка кадров
-        stitched = self.stitcher.stitch_frame(frame1_undistorted, frame2_undistorted)
-        
-        # Полный пайплайн обработки (проекция + обрезка + масштабирование)
-        processed_frame = self.stitcher.process_frame_full_pipeline(stitched)
-        
-        # Финальная проверка размера
-        if (processed_frame.shape[1], processed_frame.shape[0]) != self.stitcher.final_output_size:
-            processed_frame = cv2.resize(processed_frame, self.stitcher.final_output_size)
+        # Сшивка кадров с использованием загруженных параметров
+        processed_frame = self.stitcher.process_with_params(frame1_undistorted, frame2_undistorted)
         
         # Детекция людей
         people = self.detector.process_frame(processed_frame)
@@ -277,7 +298,7 @@ class RealTimeVideoProcessor:
         
         return result_frame
     
-    def run(self):
+    def run_processing(self):
         """Основной цикл обработки"""
         print("\n=== Запуск обработки видеопотоков ===")
         print("Нажмите 'q' для выхода")
@@ -287,8 +308,7 @@ class RealTimeVideoProcessor:
             print("Ошибка инициализации видеопотоков")
             return
         
-        if not self.initialize_stitcher():
-            print("Ошибка инициализации сшивателя")
+        if not self.initialize_stitcher_from_file():
             return
         
         if not self.initialize_video_writer():
@@ -355,6 +375,13 @@ class RealTimeVideoProcessor:
         finally:
             self.cleanup()
     
+    def run(self):
+        """Запуск в зависимости от режима"""
+        if self.mode == 'calibrate':
+            self.run_calibration()
+        else:
+            self.run_processing()
+    
     def cleanup(self):
         """Очистка ресурсов"""
         print("\nОчистка ресурсов...")
@@ -377,7 +404,7 @@ class RealTimeVideoProcessor:
         
         cv2.destroyAllWindows()
         
-        if self.start_time:
+        if self.start_time and self.mode != 'calibrate':
             total_time = time.time() - self.start_time
             avg_fps = self.saved_frames / total_time if total_time > 0 else 0
             
@@ -399,11 +426,20 @@ def main():
     parser.add_argument('--calibration', default='calibration_results.npz', 
                        help='Файл калибровки камеры')
     parser.add_argument('--output', help='Выходной файл')
+    parser.add_argument('--mode', choices=['calibrate', 'process'], default='process',
+                       help='Режим работы: calibrate - калибровка, process - обработка')
+    parser.add_argument('--params_file', default='stitching_params.pkl',
+                       help='Файл для сохранения/загрузки параметров сшивки')
     
     args = parser.parse_args()
     
     try:
-        processor = RealTimeVideoProcessor(args.config, args.calibration)
+        processor = RealTimeVideoProcessor(
+            args.config, 
+            args.calibration,
+            mode=args.mode,
+            calibration_file=args.params_file
+        )
         
         if args.output:
             processor.output_path = args.output
