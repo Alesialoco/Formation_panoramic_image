@@ -1,0 +1,23 @@
+# Параметры видеопотоков
+rtsp_url_1: "../videos/short1.avi"
+rtsp_url_2: "../videos/short2.avi"
+rtsp_url_3: "../videos/short3_resized.avi"
+
+# Параметры модели детекции
+model_path: "yolov8n.pt"
+confidence: 0.4
+skip_frames: 1
+scale: 0.2
+
+# Параметры сохранения
+save_path: "output_panorama.mp4"
+
+# Параметры сшивки
+num_calibration_frames: 10
+neutral_plane_t: 0.5
+fov_horizontal: 150
+
+# Параметры для улучшенного выравнивания краев
+adaptive_smoothness: 100.0
+crop_percent: 0.30
+
