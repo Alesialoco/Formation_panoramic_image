@@ -1,0 +1,7 @@
+videos:
+  - name: "Video1"
+    url: "rtsp://"
+  - name: "Video2"
+    url: "rtsp://"
+  - name: "Video3"
+    url: "rtsp://"
