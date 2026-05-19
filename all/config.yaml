@@ -1,13 +1,16 @@
 # Параметры видеопотоков
-rtsp_url_1: "../videos/short1.avi"
-rtsp_url_2: "../videos/short2.avi"
-rtsp_url_3: "../videos/short3_resized.avi"
+rtsp_url_1: "../videos/S4_rt.avi"
+rtsp_url_2: "../videos/S5_rt.avi"
+rtsp_url_3: "../videos/S6_rt.avi"
+rtsp_url_4: "../videos/S1_rt.avi"
+rtsp_url_5: "../videos/S2_rt.avi"
+rtsp_url_6: "../videos/S3_rt.avi"
 
 # Параметры модели детекции
 model_path: "yolov8n.pt"
 confidence: 0.4
 skip_frames: 1
-scale: 0.2
+scale: 0.5
 
 # Параметры сохранения
 save_path: "output_panorama.mp4"

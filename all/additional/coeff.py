@@ -178,7 +178,7 @@ if __name__ == "__main__":
     SQUARE_HEIGHT = 49.7  # мм
     
     # Пути к файлам
-    VIDEO_PATH = "panorama.mp4"
+    VIDEO_PATH = "Chessboard_first_1500_frames.avi"
     OUTPUT_CALIBRATION = "calibration_results"
     OUTPUT_VIDEO = "dist.mp4"
     

@@ -109,7 +109,7 @@ class OptimizedCylindricalStitcher3:
         self.video_center_path = video_center_path
         self.video_right_path = video_right_path
         self.output_path = output_path
-        self.num_calibration_frames = min(num_calibration_frames, 5) 
+        self.num_calibration_frames = num_calibration_frames 
         self.fov_horizontal = fov_horizontal
         self.adaptive_smoothness = adaptive_smoothness
         self.crop_percent = max(0.0, min(0.5, crop_percent))

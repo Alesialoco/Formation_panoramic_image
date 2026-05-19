@@ -7,6 +7,9 @@ import time
 from video_proc import Detection
 from stitch2 import OptimizedCylindricalStitcher2, StitchingParameters2
 from stitch3 import OptimizedCylindricalStitcher3, StitchingParameters3
+from stitch4 import OptimizedCylindricalStitcher4, StitchingParameters4
+from stitch5 import OptimizedCylindricalStitcher5, StitchingParameters5
+from stitch6 import OptimizedCylindricalStitcher6, StitchingParameters6
 
 
 class CameraCalibration:
@@ -37,7 +40,7 @@ class CameraCalibration:
 
 
 class RealTimeVideoProcessor:
-    """Основной класс для обработки 1, 2 или 3 видеопотоков"""
+    """Основной класс для обработки 1, 2, 3, 4, 5 или 6 видеопотоков"""
     
     def __init__(self, config_path: str, calibration_path: str = 'calibration_results.npz',
                  mode: str = 'process', calibration_file: str = 'stitching_params.pkl'):
@@ -55,8 +58,8 @@ class RealTimeVideoProcessor:
             elif isinstance(urls, str):
                 self.rtsp_urls = [urls]
         
-        # Поддержка формата rtsp_url_1, rtsp_url_2, rtsp_url_3
-        for i in range(1, 4):
+        # Поддержка формата rtsp_url_1, rtsp_url_2, rtsp_url_3, rtsp_url_4, rtsp_url_5, rtsp_url_6
+        for i in range(1, 7):
             key = f'rtsp_url_{i}'
             if key in self.config:
                 if len(self.rtsp_urls) < i:
@@ -66,12 +69,12 @@ class RealTimeVideoProcessor:
         
         if self.num_cameras == 0:
             raise ValueError("Не указаны URL видеопотоков в конфигурации. "
-                           "Используйте rtsp_url (список) или rtsp_url_1, rtsp_url_2, rtsp_url_3")
+                           "Используйте rtsp_url (список) или rtsp_url_1, rtsp_url_2, ... rtsp_url_6")
         
-        if self.num_cameras > 3:
-            print(f"Предупреждение: обнаружено {self.num_cameras} камер, поддерживается максимум 3")
-            self.rtsp_urls = self.rtsp_urls[:3]
-            self.num_cameras = 3
+        if self.num_cameras > 6:
+            print(f"Предупреждение: обнаружено {self.num_cameras} камер, поддерживается максимум 6")
+            self.rtsp_urls = self.rtsp_urls[:6]
+            self.num_cameras = 6
         
         required_params = ['model_path', 'confidence', 'skip_frames', 'scale', 'save_path']
         for param in required_params:
@@ -104,13 +107,28 @@ class RealTimeVideoProcessor:
                 print(f"Параметры сшивки (3 камеры): кадров для калибровки={self.num_calibration_frames}, "
                       f"FOV={self.fov_horizontal}°, гладкость={self.adaptive_smoothness}, "
                       f"обрезка боков={self.crop_percent*100:.1f}%")
+            elif self.num_cameras == 4:
+                print(f"Параметры сшивки (4 камеры): кадров для калибровки={self.num_calibration_frames}, "
+                      f"t={self.neutral_plane_t}, FOV={self.fov_horizontal}°, "
+                      f"гладкость={self.adaptive_smoothness}, "
+                      f"обрезка боков={self.crop_percent*100:.1f}%")
+            elif self.num_cameras == 5:
+                print(f"Параметры сшивки (5 камер): кадров для калибровки={self.num_calibration_frames}, "
+                      f"t={self.neutral_plane_t}, FOV={self.fov_horizontal}°, "
+                      f"гладкость={self.adaptive_smoothness}, "
+                      f"обрезка боков={self.crop_percent*100:.1f}%")
+            elif self.num_cameras == 6:
+                print(f"Параметры сшивки (6 камер): кадров для калибровки={self.num_calibration_frames}, "
+                      f"t={self.neutral_plane_t}, FOV={self.fov_horizontal}°, "
+                      f"гладкость={self.adaptive_smoothness}, "
+                      f"обрезка боков={self.crop_percent*100:.1f}%")
         
         self.calibration = CameraCalibration(calibration_path)
         self.detector = Detection(config_path)
         
         # Сшиватель будет создан позже в зависимости от количества камер
         self.stitcher = None
-        self.stitcher_type = None  # '2' или '3'
+        self.stitcher_type = None  # '2', '3', '4', '5', '6'
         
         self.caps = []
         self.video_writer = None
@@ -262,7 +280,7 @@ class RealTimeVideoProcessor:
                     video1_path=temp_files[0],
                     video2_path=temp_files[1],
                     output_path='temp_output',
-                    num_calibration_frames=min(5, len(calib_frames[0])),
+                    num_calibration_frames=len(calib_frames[0]),
                     neutral_plane_t=self.neutral_plane_t,
                     fov_horizontal=self.fov_horizontal,
                     adaptive_smoothness=self.adaptive_smoothness,
@@ -277,12 +295,63 @@ class RealTimeVideoProcessor:
                     video_center_path=temp_files[1],
                     video_right_path=temp_files[2],
                     output_path='temp_output',
-                    num_calibration_frames=min(5, len(calib_frames[0])),
+                    num_calibration_frames=len(calib_frames[0]),
                     fov_horizontal=self.fov_horizontal,
                     adaptive_smoothness=self.adaptive_smoothness,
                     crop_percent=self.crop_percent
                 )
                 self.stitcher_type = '3'
+                
+            elif self.num_cameras == 4:
+                # Используем OptimizedCylindricalStitcher4 из stitch4.py
+                self.stitcher = OptimizedCylindricalStitcher4(
+                    video1_path=temp_files[0],
+                    video2_path=temp_files[1],
+                    video3_path=temp_files[2],
+                    video4_path=temp_files[3],
+                    output_path='temp_output',
+                    num_calibration_frames=len(calib_frames[0]),
+                    neutral_plane_t=self.neutral_plane_t,
+                    fov_horizontal=self.fov_horizontal,
+                    adaptive_smoothness=self.adaptive_smoothness,
+                    crop_percent=self.crop_percent
+                )
+                self.stitcher_type = '4'
+                
+            elif self.num_cameras == 5:
+                # Используем OptimizedCylindricalStitcher5 из stitch5.py
+                self.stitcher = OptimizedCylindricalStitcher5(
+                    video1_path=temp_files[0],
+                    video2_path=temp_files[1],
+                    video3_path=temp_files[2],
+                    video4_path=temp_files[3],
+                    video5_path=temp_files[4],
+                    output_path='temp_output',
+                    num_calibration_frames=len(calib_frames[0]),
+                    neutral_plane_t=self.neutral_plane_t,
+                    fov_horizontal=self.fov_horizontal,
+                    adaptive_smoothness=self.adaptive_smoothness,
+                    crop_percent=self.crop_percent
+                )
+                self.stitcher_type = '5'
+                
+            elif self.num_cameras == 6:
+                # Используем OptimizedCylindricalStitcher6 из stitch6.py
+                self.stitcher = OptimizedCylindricalStitcher6(
+                    video1_path=temp_files[0],
+                    video2_path=temp_files[1],
+                    video3_path=temp_files[2],
+                    video4_path=temp_files[3],
+                    video5_path=temp_files[4],
+                    video6_path=temp_files[5],
+                    output_path='temp_output',
+                    num_calibration_frames=len(calib_frames[0]),
+                    neutral_plane_t=self.neutral_plane_t,
+                    fov_horizontal=self.fov_horizontal,
+                    adaptive_smoothness=self.adaptive_smoothness,
+                    crop_percent=self.crop_percent
+                )
+                self.stitcher_type = '6'
             
             # Выполняем калибровку и сохраняем параметры
             print("Выполнение калибровки...")
@@ -325,8 +394,12 @@ class RealTimeVideoProcessor:
                 self.stitcher.set_parameters(params2)
                 self.stitcher_type = '2'
                 print(f"Загружены параметры для 2 камер")
+                return True
             except:
-                # Если не получилось, пробуем как параметры для 3 камер
+                pass
+            
+            # Пробуем загрузить как параметры для 3 камер
+            try:
                 params3 = StitchingParameters3.load(self.calibration_file)
                 self.stitcher = OptimizedCylindricalStitcher3(
                     fov_horizontal=params3.fov_horizontal,
@@ -336,9 +409,57 @@ class RealTimeVideoProcessor:
                 self.stitcher.set_parameters(params3)
                 self.stitcher_type = '3'
                 print(f"Загружены параметры для 3 камер")
+                return True
+            except:
+                pass
             
-            print(f"Сшиватель инициализирован. Финальный размер: {self.stitcher.final_output_size}")
-            return True
+            # Пробуем загрузить как параметры для 4 камер
+            try:
+                params4 = StitchingParameters4.load(self.calibration_file)
+                self.stitcher = OptimizedCylindricalStitcher4(
+                    fov_horizontal=params4.fov_horizontal,
+                    adaptive_smoothness=params4.adaptive_smoothness,
+                    crop_percent=params4.crop_percent
+                )
+                self.stitcher.set_parameters(params4)
+                self.stitcher_type = '4'
+                print(f"Загружены параметры для 4 камер")
+                return True
+            except:
+                pass
+            
+            # Пробуем загрузить как параметры для 5 камер
+            try:
+                params5 = StitchingParameters5.load(self.calibration_file)
+                self.stitcher = OptimizedCylindricalStitcher5(
+                    fov_horizontal=params5.fov_horizontal,
+                    adaptive_smoothness=params5.adaptive_smoothness,
+                    crop_percent=params5.crop_percent
+                )
+                self.stitcher.set_parameters(params5)
+                self.stitcher_type = '5'
+                print(f"Загружены параметры для 5 камер")
+                return True
+            except:
+                pass
+            
+            # Пробуем загрузить как параметры для 6 камер
+            try:
+                params6 = StitchingParameters6.load(self.calibration_file)
+                self.stitcher = OptimizedCylindricalStitcher6(
+                    fov_horizontal=params6.fov_horizontal,
+                    adaptive_smoothness=params6.adaptive_smoothness,
+                    crop_percent=params6.crop_percent
+                )
+                self.stitcher.set_parameters(params6)
+                self.stitcher_type = '6'
+                print(f"Загружены параметры для 6 камер")
+                return True
+            except:
+                pass
+            
+            print(f"Ошибка: Не удалось загрузить параметры для известного типа сшивателя")
+            return False
             
         except Exception as e:
             print(f"Ошибка при загрузке параметров: {e}")
@@ -406,6 +527,19 @@ class RealTimeVideoProcessor:
         elif self.stitcher_type == '3':
             processed_frame = self.stitcher.process_with_params(
                 undistorted_frames[0], undistorted_frames[1], undistorted_frames[2])
+        elif self.stitcher_type == '4':
+            processed_frame = self.stitcher.process_with_params(
+                undistorted_frames[0], undistorted_frames[1], 
+                undistorted_frames[2], undistorted_frames[3])
+        elif self.stitcher_type == '5':
+            processed_frame = self.stitcher.process_with_params(
+                undistorted_frames[0], undistorted_frames[1], 
+                undistorted_frames[2], undistorted_frames[3], undistorted_frames[4])
+        elif self.stitcher_type == '6':
+            processed_frame = self.stitcher.process_with_params(
+                undistorted_frames[0], undistorted_frames[1], 
+                undistorted_frames[2], undistorted_frames[3], 
+                undistorted_frames[4], undistorted_frames[5])
         else:
             return undistorted_frames[0]
         
@@ -420,6 +554,7 @@ class RealTimeVideoProcessor:
         print(f"\n=== Запуск обработки видеопотоков ({self.num_cameras} камер) ===")
         print("Нажмите 'q' для выхода")
         print("Нажмите 'p' для паузы/продолжения")
+        print("Нажмите 's' для сохранения скриншота")
         
         if not self.initialize_video_streams():
             print("Ошибка инициализации видеопотоков")
@@ -571,7 +706,7 @@ class RealTimeVideoProcessor:
 
 def main():
     """Основная функция"""
-    parser = argparse.ArgumentParser(description='Обработка видеопотоков (1-3 камеры)')
+    parser = argparse.ArgumentParser(description='Обработка видеопотоков (1-6 камеры)')
     parser.add_argument('--config', default='config.yaml', help='Конфигурационный файл')
     parser.add_argument('--calibration', default='calibration_results.npz', 
                        help='Файл калибровки камеры')
